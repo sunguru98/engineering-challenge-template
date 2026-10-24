@@ -8,8 +8,14 @@ build = "src/util/build.rs"
 anyhow = "1"
 chrono = "0.4"
 crossbeam = "0.8.4"
+futures-util = "0.3.34"
+rand = "0.10.3"
+reqwest = { version = "0.13.5", features = ["json", "query"] }
 serde = { version = "1", features = ["derive"] }
+serde_json = "1.0.154"
 tempfile = "3"
+tokio = { version = "1.54.1", features = ["full"] }
+tokio-tungstenite = "0.30.0"
 
 [build-dependencies]
 ergo-sbe = "=0.1.16"
