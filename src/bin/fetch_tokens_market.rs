@@ -1,14 +1,5 @@
 use rand::RngExt;
 
-pub fn convert_to_schema_int(input: &str) -> anyhow::Result<i64> {
-    let data = input.parse::<f64>()?;
-    if data.is_nan() || data < 0.0 {
-        anyhow::bail!("Invalid input")
-    }
-
-    Ok((data * 1_000_000.0).round() as i64)
-}
-
 pub const URL: &'static str = "https://gamma-api.polymarket.com/markets/keyset";
 
 pub async fn fetch_page(
@@ -30,6 +21,12 @@ pub async fn fetch_page(
     let mut skip_counter = 0;
     let mut token_ids: Vec<String> = vec![];
     for market in markets {
+        let mut index = 0usize;
+        if let Some(outcomes) = market["outcomes"].as_str() {
+            let outcomes = serde_json::from_str::<Vec<&str>>(outcomes)?;
+            index = if outcomes[0] == "Yes" { 0 } else { 1 }
+        }
+
         let is_active = market["active"].as_bool();
         let is_closed = market["closed"].as_bool();
         let is_orderbook_enabled = market["enableOrderBook"].as_bool();
@@ -58,7 +55,7 @@ pub async fn fetch_page(
                 continue;
             }
 
-            token_ids.append(&mut clob_token_ids);
+            token_ids.push(clob_token_ids.remove(index));
         }
     }
 
