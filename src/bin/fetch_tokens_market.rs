@@ -55,7 +55,7 @@ pub async fn fetch_page(
                 continue;
             }
 
-            token_ids.push(clob_token_ids.remove(index));
+            token_ids.push(clob_token_ids.swap_remove(index));
         }
     }
 
