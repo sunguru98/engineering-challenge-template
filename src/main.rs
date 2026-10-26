@@ -62,12 +62,12 @@ pub fn fetch_asset_ids() -> anyhow::Result<(HashMap<String, Orderbook>, Vec<Vec<
     let mut batch_counter = 1usize;
 
     for token_id in token_ids.lines().map(String::from).into_iter() {
+        batch.push(token_id.clone());
         if batch_counter == 10_000 {
             batches.push(batch);
             batch = vec![];
             batch_counter = 0;
         } else {
-            batch.push(token_id.clone());
             batch_counter += 1;
         }
 
@@ -145,11 +145,14 @@ async fn main() -> anyhow::Result<()> {
     println!("Total assets: {}", assets_ids.len());
     println!("Total batches: {}", batches.len());
 
-    let (sender, mut receiver) = tokio::sync::mpsc::channel::<Event>(1_000);
+    let (sender, mut receiver) = tokio::sync::mpsc::channel::<Event>(10_000);
+    let (signal_sender, signal_receiver) = tokio::sync::watch::channel(false);
 
-    let mut join_set: JoinSet<anyhow::Result<(), anyhow::Error>> = tokio::task::JoinSet::new();
+    let mut join_set: JoinSet<anyhow::Result<usize>> = tokio::task::JoinSet::new();
     for (batch_idx, batch) in batches.into_iter().enumerate() {
         let sender = sender.clone();
+        let mut signal_receiver = signal_receiver.clone();
+
         let payload = serde_json::to_string(&SubscriptionPayload {
             assets_ids: batch,
             r#type: "market",
@@ -175,7 +178,7 @@ async fn main() -> anyhow::Result<()> {
                         ))
                         .await?;
 
-                    println!("Subscription done for batch#{batch_idx} :)");
+                    println!("Subscription done for websocket batch #{batch_idx} :)");
 
                     let mut heartbeat_interval =
                         tokio::time::interval(std::time::Duration::from_secs(10));
@@ -183,8 +186,13 @@ async fn main() -> anyhow::Result<()> {
 
                     loop {
                         tokio::select! {
+                            _ = signal_receiver.changed() => {
+                                if *signal_receiver.borrow() {
+                                    break;
+                                }
+                            }
                             _ = heartbeat_interval.tick() => {
-                                println!("Heartbeat check");
+                                println!("Heartbeat check for #{batch_idx}");
                                 write.send(tokio_tungstenite::tungstenite::Message::Text("PING".into())).await?;
                             }
 
@@ -233,6 +241,7 @@ async fn main() -> anyhow::Result<()> {
                             }
                         }
                     }
+                    Ok(())
                 }
                 .await;
 
@@ -240,9 +249,21 @@ async fn main() -> anyhow::Result<()> {
                     eprintln!("Connection error: {err}")
                 }
 
+                if *signal_receiver.borrow() {
+                    println!("Shutting down websocket batch #{batch_idx}");
+                    break;
+                }
                 let jitter_ms = std::time::Duration::from_millis(rand::rng().random_range(0..750));
                 let waiting_seconds = delay_seconds + jitter_ms;
-                tokio::time::sleep(waiting_seconds).await;
+                tokio::select! {
+                    _ = signal_receiver.changed() => {
+                        if *signal_receiver.borrow() {
+                            println!("Shutting down websocket batch #{batch_idx}");
+                            break;
+                        }
+                    }
+                    _ = tokio::time::sleep(waiting_seconds) => {}
+                }
 
                 delay_seconds = (delay_seconds * 2).min(maximum_delay_seconds);
                 attempt_number += 1;
@@ -251,6 +272,8 @@ async fn main() -> anyhow::Result<()> {
                     anyhow::bail!("Connection failed");
                 }
             }
+
+            Ok(batch_idx)
         });
     }
     drop(sender);
@@ -258,9 +281,26 @@ async fn main() -> anyhow::Result<()> {
     let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
     interval.tick().await;
 
+    let mut shutting_down = false;
+    let mut all_events_processed = false;
+    let mut work_complete = false;
+    let sigint = tokio::signal::ctrl_c();
+    tokio::pin!(sigint);
+
     loop {
+        if shutting_down && all_events_processed && work_complete {
+            break;
+        }
+
         tokio::select! {
+            _ = &mut sigint, if !shutting_down => {
+                println!("\nCommencing Shutdown");
+                signal_sender.send(true)?;
+                shutting_down = true;
+            }
+
             _ = interval.tick() => {
+                println!("Creating a snapshot at {}", chrono::Utc::now());
                 for (asset_id, orderbook) in assets_ids.iter() {
                     let mut asks = vec![];
                     for (price_level, quantity) in orderbook.asks.iter() {
@@ -285,81 +325,102 @@ async fn main() -> anyhow::Result<()> {
                         received_at: chrono::Utc::now(),
                         symbol: asset_id.to_owned(),
                     };
-
-                    println!("Creating a snapshot at {}", chrono::Utc::now());
                     // println!("{snapshot:?}");
                     writer.write_msg(&snapshot)?;
                 }
             }
-            Some(event) = receiver.recv() => {
-                let e_data = event.data;
-                match event.e_type {
-                    EType::Book => {
-                        let asset_id = e_data["asset_id"].as_str().context("Asset id not found")?;
-                        let orderbook = assets_ids.get_mut(asset_id).context("Invalid asset id")?;
-                        let timestamp = e_data["timestamp"]
-                            .as_str()
-                            .context("Timestamp not found")?;
 
-                        orderbook.timestamp = chrono::DateTime::from_timestamp_millis(timestamp.parse()?)
-                            .context("Failed to parse timestamp")?;
-                        orderbook.asks.clear();
-                        orderbook.bids.clear();
-
-                        let book_event = BookEvent::deserialize(&e_data)?;
-                        for ask in book_event.asks {
-                            let ask_price = convert_to_schema_int(&ask.price)?;
-                            let ask_size = convert_to_schema_int(&ask.size)?;
-                            orderbook.asks.insert(ask_price, ask_size);
-                        }
-
-                        for bid in book_event.bids {
-                            let bid_price = convert_to_schema_int(&bid.price)?;
-                            let bid_size = convert_to_schema_int(&bid.size)?;
-                            orderbook.bids.insert(bid_price, bid_size);
-                        }
+            join_result = join_set.join_next(), if shutting_down && !work_complete => {
+                match join_result {
+                    Some(Ok(Ok(batch_idx))) => println!("Websocket #{batch_idx} finished running"),
+                    Some(Ok(Err(err))) => eprintln!("Websocket finished with error: {err:?}"),
+                    Some(Err(err)) => eprintln!("Task returned with error: {err:?}"),
+                    None => {
+                        println!("All websockets closed");
+                        work_complete = true
                     }
-                    EType::PriceChange => {
-                        let mut price_change_event = PriceChangeEvent::deserialize(&e_data)?;
-                        for pc in price_change_event.price_changes.iter_mut() {
-                            if let Some(orderbook) = assets_ids.get_mut(&pc.asset_id) {
-                                let price_level = convert_to_schema_int(&pc.price)?;
-                                let quantity = convert_to_schema_int(&pc.size)?;
-                                let side = if &pc.side == "SELL" {
-                                    engineering_challenge::Side::Sell
-                                } else if &pc.side == "BUY" {
-                                    engineering_challenge::Side::Buy
-                                } else {
-                                    anyhow::bail!("Invalid side");
-                                };
+                }
+            }
 
-                                let price_level_update = PriceLevelUpdateDomain {
-                                    exchange_timestamp: chrono::DateTime::from_timestamp_millis(
-                                        price_change_event.timestamp.parse()?,
-                                    )
-                                    .context("Failed to parse timestamp")?,
-                                    backtest_timestamp: chrono::Utc::now(),
-                                    price_level,
-                                    quantity,
-                                    side,
-                                    symbol: std::mem::take(&mut pc.asset_id),
-                                };
+            event = receiver.recv(), if !all_events_processed => {
+                match event {
+                    None => {
+                        all_events_processed = true;
+                    }
+                    Some(event) => {
+                        let e_data = event.data;
+                        match event.e_type {
+                            EType::Book => {
+                                let asset_id = e_data["asset_id"].as_str().context("Asset id not found")?;
+                                let orderbook = assets_ids.get_mut(asset_id).context("Invalid asset id")?;
+                                let timestamp = e_data["timestamp"]
+                                    .as_str()
+                                    .context("Timestamp not found")?;
 
+                                orderbook.timestamp = chrono::DateTime::from_timestamp_millis(timestamp.parse()?)
+                                    .context("Failed to parse timestamp")?;
+                                orderbook.asks.clear();
+                                orderbook.bids.clear();
 
-                                if quantity == 0 {
-                                    match side {
-                                        engineering_challenge::Side::Buy => orderbook.bids.remove(&price_level),
-                                        engineering_challenge::Side::Sell => orderbook.asks.remove(&price_level),
-                                    };
-                                } else {
-                                    match side {
-                                        engineering_challenge::Side::Buy => orderbook.bids.insert(price_level, quantity),
-                                        engineering_challenge::Side::Sell => orderbook.asks.insert(price_level, quantity),
-                                    };
+                                let book_event = BookEvent::deserialize(&e_data)?;
+                                for ask in book_event.asks {
+                                    let ask_price = convert_to_schema_int(&ask.price)?;
+                                    let ask_size = convert_to_schema_int(&ask.size)?;
+                                    orderbook.asks.insert(ask_price, ask_size);
                                 }
 
-                                // println!("{price_level_update:?}");
-                                writer.write_msg(&price_level_update)?;
+                                for bid in book_event.bids {
+                                    let bid_price = convert_to_schema_int(&bid.price)?;
+                                    let bid_size = convert_to_schema_int(&bid.size)?;
+                                    orderbook.bids.insert(bid_price, bid_size);
+                                }
+                            }
+                            EType::PriceChange => {
+                                let mut price_change_event = PriceChangeEvent::deserialize(&e_data)?;
+                                for pc in price_change_event.price_changes.iter_mut() {
+                                    if let Some(orderbook) = assets_ids.get_mut(&pc.asset_id) {
+                                        let price_level = convert_to_schema_int(&pc.price)?;
+                                        let quantity = convert_to_schema_int(&pc.size)?;
+                                        let side = if &pc.side == "SELL" {
+                                            engineering_challenge::Side::Sell
+                                        } else if &pc.side == "BUY" {
+                                            engineering_challenge::Side::Buy
+                                        } else {
+                                            anyhow::bail!("Invalid side");
+                                        };
+
+                                        let exchange_timestamp = chrono::DateTime::from_timestamp_millis(
+                                            price_change_event.timestamp.parse()?,
+                                        )
+                                        .context("Failed to parse timestamp")?;
+
+                                        orderbook.timestamp = exchange_timestamp;
+                                        let price_level_update = PriceLevelUpdateDomain {
+                                            exchange_timestamp,
+                                            backtest_timestamp: chrono::Utc::now(),
+                                            price_level,
+                                            quantity,
+                                            side,
+                                            symbol: std::mem::take(&mut pc.asset_id),
+                                        };
+
+
+                                        if quantity == 0 {
+                                            match side {
+                                                engineering_challenge::Side::Buy => orderbook.bids.remove(&price_level),
+                                                engineering_challenge::Side::Sell => orderbook.asks.remove(&price_level),
+                                            };
+                                        } else {
+                                            match side {
+                                                engineering_challenge::Side::Buy => orderbook.bids.insert(price_level, quantity),
+                                                engineering_challenge::Side::Sell => orderbook.asks.insert(price_level, quantity),
+                                            };
+                                        }
+
+                                        // println!("{price_level_update:?}");
+                                        writer.write_msg(&price_level_update)?;
+                                    }
+                                }
                             }
                         }
                     }
@@ -367,4 +428,7 @@ async fn main() -> anyhow::Result<()> {
             }
         }
     }
+
+    writer.flush()?;
+    Ok(())
 }
