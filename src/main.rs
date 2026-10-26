@@ -177,43 +177,62 @@ async fn main() -> anyhow::Result<()> {
 
                     println!("Subscription done for batch#{batch_idx} :)");
 
-                    while let Some(response) = read.next().await {
-                        match response {
-                            Ok(Message::Text(text)) => {
-                                let data = serde_json::from_str::<serde_json::Value>(&text)?;
-                                let events = match data {
-                                    serde_json::Value::Array(items) => items.into_iter().collect(),
-                                    serde_json::Value::Object(_) => vec![data],
-                                    _ => vec![],
+                    let mut heartbeat_interval =
+                        tokio::time::interval(std::time::Duration::from_secs(10));
+                    heartbeat_interval.tick().await;
+
+                    loop {
+                        tokio::select! {
+                            _ = heartbeat_interval.tick() => {
+                                println!("Heartbeat check");
+                                write.send(tokio_tungstenite::tungstenite::Message::Text("PING".into())).await?;
+                            }
+
+                            response = read.next() => {
+                                let Some(response) = response else {
+                                    anyhow::bail!("Stream ended unxpectedly");
                                 };
 
-                                for event in events {
-                                    let event_type = event["event_type"]
-                                        .as_str()
-                                        .context("Unable to find event_type")?;
+                                match response {
+                                    Ok(Message::Text(text)) => {
+                                        if text == "PONG" {
+                                            continue
+                                        }
 
-                                    let event_type = if event_type == "book" {
-                                        EType::Book
-                                    } else if event_type == "price_change" {
-                                        EType::PriceChange
-                                    } else {
-                                        anyhow::bail!("Invalid event received");
-                                    };
+                                        let data = serde_json::from_str::<serde_json::Value>(&text)?;
+                                        let events = match data {
+                                            serde_json::Value::Array(items) => items.into_iter().collect(),
+                                            serde_json::Value::Object(_) => vec![data],
+                                            _ => vec![],
+                                        };
 
-                                    let block_event = Event {
-                                        data: event,
-                                        e_type: event_type,
-                                    };
+                                        for event in events {
+                                            let event_type = event["event_type"]
+                                                .as_str()
+                                                .context("Unable to find event_type")?;
 
-                                    sender.send(block_event).await?;
+                                            let event_type = if event_type == "book" {
+                                                EType::Book
+                                            } else if event_type == "price_change" {
+                                                EType::PriceChange
+                                            } else {
+                                                continue
+                                            };
+
+                                            let block_event = Event {
+                                                data: event,
+                                                e_type: event_type,
+                                            };
+
+                                            sender.send(block_event).await?;
+                                        }
+                                    }
+                                    Ok(other_msg) => println!("Other message received: {other_msg}"),
+                                    Err(e) => anyhow::bail!(e),
                                 }
                             }
-                            Ok(other_msg) => println!("Other message received: {other_msg}"),
-                            Err(e) => anyhow::bail!(e),
                         }
                     }
-
-                    anyhow::bail!("Stream ended unxpectedly");
                 }
                 .await;
 
@@ -236,13 +255,12 @@ async fn main() -> anyhow::Result<()> {
     }
     drop(sender);
 
-    let mut interval = tokio::time::interval(std::time::Duration::from_secs(10));
+    let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
     interval.tick().await;
 
     loop {
         tokio::select! {
             _ = interval.tick() => {
-                println!("Creating a snapshot at {}", chrono::Utc::now());
                 for (asset_id, orderbook) in assets_ids.iter() {
                     let mut asks = vec![];
                     for (price_level, quantity) in orderbook.asks.iter() {
@@ -268,6 +286,8 @@ async fn main() -> anyhow::Result<()> {
                         symbol: asset_id.to_owned(),
                     };
 
+                    println!("Creating a snapshot at {}", chrono::Utc::now());
+                    // println!("{snapshot:?}");
                     writer.write_msg(&snapshot)?;
                 }
             }
@@ -325,7 +345,6 @@ async fn main() -> anyhow::Result<()> {
                                     symbol: std::mem::take(&mut pc.asset_id),
                                 };
 
-                                println!("{price_level_update:?}");
 
                                 if quantity == 0 {
                                     match side {
@@ -339,6 +358,7 @@ async fn main() -> anyhow::Result<()> {
                                     };
                                 }
 
+                                // println!("{price_level_update:?}");
                                 writer.write_msg(&price_level_update)?;
                             }
                         }
@@ -348,45 +368,3 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 }
-
-// loop {
-//
-
-//         response_stream = read.next() => {
-//             match response_stream {
-//                 Some(Ok(tokio_tungstenite::tungstenite::Message::Text(text))) => {
-//                         // std::fs::write("data.json", &text)?;
-//
-//                 }
-//                 Some(Ok(msg)) => {
-//                     println!("Other message: {msg}");
-//                 }
-//                 Some(Err(e)) => {
-//                     eprintln!("{e:?}");
-//                     break;
-//                 }
-//                 None => {
-//                     println!("Connection closed");
-//                     break;
-//                 }
-//             }
-//         }
-//     }
-// }
-
-// writer.flush()?;
-
-// let mut reader = AlignedSbeReader::<OrderbookSchema>::open(file)?;
-
-// let Some(AnyMessage::Snapshot(decoded)) = reader.read_msg()? else {
-//     anyhow::bail!("expected snapshot");
-// };
-// assert_eq!(SnapshotDomain::try_from_decoder(decoded)?, snapshot);
-
-// let Some(AnyMessage::PriceLevelUpdate(decoded)) = reader.read_msg()? else {
-//     anyhow::bail!("expected price level update");
-// };
-// assert_eq!(PriceLevelUpdateDomain::try_from_decoder(decoded)?, update);
-// assert!(reader.read_msg()?.is_none());
-
-// println!("Verification success!");
