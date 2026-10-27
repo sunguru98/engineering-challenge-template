@@ -17,6 +17,7 @@ const CHUNK_SIZE_64_MEBIBYTES: usize = 64 << 20;
 pub struct SubscriptionPayload {
     pub assets_ids: Vec<String>,
     pub r#type: &'static str,
+    pub custom_feature_enabled: bool,
 }
 
 #[derive(serde::Serialize, serde::Deserialize, Debug)]
@@ -40,6 +41,12 @@ pub struct PriceChangeEvent {
 }
 
 #[derive(serde::Serialize, serde::Deserialize, Debug)]
+pub struct MarketResolvedEvent {
+    pub assets_ids: Vec<String>,
+    pub timestamp: String,
+}
+
+#[derive(serde::Serialize, serde::Deserialize, Debug)]
 pub struct PriceChange {
     pub asset_id: String,
     pub price: String,
@@ -47,13 +54,58 @@ pub struct PriceChange {
     pub size: String,
 }
 
+#[derive(Debug)]
+pub enum EType {
+    Book,
+    PriceChange,
+    NewMarket,
+    MarketResolved,
+}
+
+#[derive(Debug)]
+pub struct Event {
+    pub e_type: EType,
+    pub data: serde_json::Value,
+}
+
+#[derive(Debug)]
+pub enum UpdateEvents {
+    MarketResolved { asset_ids: Vec<String> },
+    NewMarket { asset_ids: Vec<String> },
+}
+
+#[derive(Debug)]
 pub struct Orderbook {
     pub timestamp: chrono::DateTime<chrono::Utc>,
     pub bids: std::collections::BTreeMap<i64, i64>,
     pub asks: std::collections::BTreeMap<i64, i64>,
 }
 
-pub fn fetch_asset_ids() -> anyhow::Result<(HashMap<String, Orderbook>, Vec<Vec<String>>)> {
+pub fn extract_asset_id(market: &serde_json::Value) -> anyhow::Result<Option<String>> {
+    if market["active"].as_bool() == Some(true) {
+        let clob_token_ids = market["clob_token_ids"].as_array();
+        if clob_token_ids.is_none() {
+            return Ok(None);
+        }
+
+        let clob_token_ids = clob_token_ids.unwrap();
+        if clob_token_ids.len() != 2 {
+            return Ok(None);
+        }
+
+        if let Some(token_id) = clob_token_ids[0].as_str() {
+            return Ok(Some(token_id.into()));
+        }
+    }
+
+    Ok(None)
+}
+
+pub fn fetch_asset_ids() -> anyhow::Result<(
+    HashMap<String, Orderbook>,
+    Vec<Vec<String>>,
+    HashMap<String, usize>,
+)> {
     let token_ids = std::fs::read_to_string("token_ids.txt")?;
     let mut assets_ids = std::collections::HashMap::new();
 
@@ -61,12 +113,17 @@ pub fn fetch_asset_ids() -> anyhow::Result<(HashMap<String, Orderbook>, Vec<Vec<
     let mut batch: Vec<String> = vec![];
     let mut batch_counter = 1usize;
 
+    let mut batch_idx = 0usize;
+    let mut asset_batch_map = HashMap::new();
+
     for token_id in token_ids.lines().map(String::from).into_iter() {
         batch.push(token_id.clone());
-        if batch_counter == 10_000 {
+        asset_batch_map.insert(token_id.clone(), batch_idx);
+        if batch_counter == 5_000 {
             batches.push(batch);
             batch = vec![];
             batch_counter = 0;
+            batch_idx += 1;
         } else {
             batch_counter += 1;
         }
@@ -85,7 +142,7 @@ pub fn fetch_asset_ids() -> anyhow::Result<(HashMap<String, Orderbook>, Vec<Vec<
         batches.push(batch)
     }
 
-    Ok((assets_ids, batches))
+    Ok((assets_ids, batches, asset_batch_map))
 }
 
 fn convert_to_schema_int(input: &str) -> anyhow::Result<i64> {
@@ -124,39 +181,35 @@ fn convert_to_schema_int(input: &str) -> anyhow::Result<i64> {
         .context("Invalid input: numeric overflow")
 }
 
-#[derive(Debug)]
-pub enum EType {
-    Book,
-    PriceChange,
-}
-
-#[derive(Debug)]
-pub struct Event {
-    pub e_type: EType,
-    pub data: serde_json::Value,
-}
-
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let file = std::path::Path::new("data.bin");
     let mut writer = AlignedSbeWriter::create(file, CHUNK_SIZE_64_MEBIBYTES)?;
 
-    let (mut assets_ids, batches) = fetch_asset_ids()?;
+    let (mut assets_ids, batches, mut asset_worker_map) = fetch_asset_ids()?;
     println!("Total assets: {}", assets_ids.len());
-    println!("Total batches: {}", batches.len());
+    let batches_len = batches.len();
+    println!("Total batches: {batches_len}");
 
-    let (sender, mut receiver) = tokio::sync::mpsc::channel::<Event>(10_000);
+    let mut batch_sender_map = HashMap::new();
+
+    let (sender, mut receiver) = tokio::sync::mpsc::channel::<Event>(25_000);
     let (signal_sender, signal_receiver) = tokio::sync::watch::channel(false);
 
     let mut join_set: JoinSet<anyhow::Result<usize>> = tokio::task::JoinSet::new();
     for (batch_idx, batch) in batches.into_iter().enumerate() {
-        let sender = sender.clone();
-        let mut signal_receiver = signal_receiver.clone();
-
         let payload = serde_json::to_string(&SubscriptionPayload {
             assets_ids: batch,
             r#type: "market",
+            custom_feature_enabled: true,
         })?;
+
+        let (event_sender, mut event_receiver) = tokio::sync::mpsc::channel::<UpdateEvents>(100);
+        batch_sender_map.insert(batch_idx, event_sender);
+        let mut event_sender_closed = false;
+
+        let mut signal_receiver = signal_receiver.clone();
+        let sender = sender.clone();
 
         join_set.spawn(async move {
             let mut attempt_number = 1;
@@ -196,6 +249,34 @@ async fn main() -> anyhow::Result<()> {
                                 write.send(tokio_tungstenite::tungstenite::Message::Text("PING".into())).await?;
                             }
 
+                            update_event = event_receiver.recv(), if !event_sender_closed => {
+                                match update_event {
+                                    Some(update_event) => {
+                                        match update_event {
+                                            UpdateEvents::MarketResolved { asset_ids } => {
+                                                write.send(format!(r#"
+                                                {{
+                                                    \"operation\": \"unsubscribe\",
+                                                    \"assets_ids\": {}
+                                                }}"#, serde_json::to_string(&asset_ids)?).into()).await?;
+                                                println!("Unsubscribed market of {asset_ids:?} succesfully")
+                                            },
+                                            UpdateEvents::NewMarket { asset_ids } => {
+                                                write.send(format!(r#"
+                                                {{
+                                                    \"operation\": \"subscribe\",
+                                                    \"assets_ids\": {}
+                                                }}"#, serde_json::to_string(&asset_ids)?).into()).await?;
+                                                println!("New market of {asset_ids:?} added succesfully")
+                                            }
+                                        }
+                                    },
+                                    None => {
+                                        event_sender_closed = true
+                                    }
+                                }
+                            }
+
                             response = read.next() => {
                                 let Some(response) = response else {
                                     anyhow::bail!("Stream ended unxpectedly");
@@ -203,36 +284,34 @@ async fn main() -> anyhow::Result<()> {
 
                                 match response {
                                     Ok(Message::Text(text)) => {
-                                        if text == "PONG" {
-                                            continue
-                                        }
-
-                                        let data = serde_json::from_str::<serde_json::Value>(&text)?;
-                                        let events = match data {
-                                            serde_json::Value::Array(items) => items.into_iter().collect(),
-                                            serde_json::Value::Object(_) => vec![data],
-                                            _ => vec![],
-                                        };
-
-                                        for event in events {
-                                            let event_type = event["event_type"]
-                                                .as_str()
-                                                .context("Unable to find event_type")?;
-
-                                            let event_type = if event_type == "book" {
-                                                EType::Book
-                                            } else if event_type == "price_change" {
-                                                EType::PriceChange
-                                            } else {
-                                                continue
+                                        if let Ok(data) = serde_json::from_str::<serde_json::Value>(&text){
+                                            let events = match data {
+                                                serde_json::Value::Array(items) => items.into_iter().collect(),
+                                                serde_json::Value::Object(_) => vec![data],
+                                                _ => vec![],
                                             };
 
-                                            let block_event = Event {
-                                                data: event,
-                                                e_type: event_type,
-                                            };
+                                            for event in events {
+                                                let event_type = event["event_type"]
+                                                    .as_str()
+                                                    .context("Unable to find event_type")?;
+                                                let event_type = match event_type {
+                                                    "book"  => EType::Book,
+                                                    "price_change" => EType::PriceChange,
+                                                    "new_market" => EType::NewMarket,
+                                                    "market_resolved" => EType::MarketResolved,
+                                                    _ => {
+                                                        continue
+                                                    }
+                                                };
 
-                                            sender.send(block_event).await?;
+                                                let block_event = Event {
+                                                    data: event,
+                                                    e_type: event_type,
+                                                };
+
+                                                sender.send(block_event).await?;
+                                            }
                                         }
                                     }
                                     Ok(other_msg) => println!("Other message received: {other_msg}"),
@@ -284,9 +363,10 @@ async fn main() -> anyhow::Result<()> {
     let mut shutting_down = false;
     let mut all_events_processed = false;
     let mut work_complete = false;
+    let mut next_batch_idx = 0;
+
     let sigint = tokio::signal::ctrl_c();
     tokio::pin!(sigint);
-
     loop {
         if shutting_down && all_events_processed && work_complete {
             break;
@@ -350,9 +430,61 @@ async fn main() -> anyhow::Result<()> {
                     Some(event) => {
                         let e_data = event.data;
                         match event.e_type {
+                            EType::MarketResolved => {
+                                let market_resolved_event = MarketResolvedEvent::deserialize(&e_data)?;
+                                let mut unsubscribing_ids = vec![];
+                                for asset_id in market_resolved_event.assets_ids.into_iter() {
+                                    if assets_ids.get(&asset_id).is_some() {
+                                        unsubscribing_ids.push(asset_id);
+                                    }
+                                }
+
+                                for id in unsubscribing_ids.into_iter() {
+                                    if let Some(batch_idx) = asset_worker_map.get(&id) {
+                                        if let Some(sender) = batch_sender_map.get(&batch_idx) {
+                                            println!("Marking {id} as resolved to batch #{batch_idx}");
+                                            sender.send(
+                                                UpdateEvents::MarketResolved {
+                                                    asset_ids: vec![id.clone()]
+                                                }
+                                            ).await?;
+                                            assets_ids.remove(&id);
+                                            asset_worker_map.remove(&id);
+                                        }
+                                    }
+                                }
+                            },
+                            EType::NewMarket => {
+                                if let Some(asset_id) = extract_asset_id(&e_data)? {
+                                    println!("New market notified of asset_id: {asset_id}");
+                                    if assets_ids.get(&asset_id).is_none() {
+                                        if let Some(sender) = batch_sender_map.get(&next_batch_idx) {
+                                            sender.send(
+                                                UpdateEvents::NewMarket{
+                                                    asset_ids: vec![asset_id.clone()]
+                                                }
+                                            ).await?;
+
+                                            assets_ids.insert(
+                                                asset_id.clone(),
+                                                Orderbook {
+                                                    timestamp: chrono::Utc::now(),
+                                                    bids: std::collections::BTreeMap::new(),
+                                                    asks: std::collections::BTreeMap::new(),
+                                                }
+                                            );
+                                            asset_worker_map.insert(asset_id.clone(), next_batch_idx);
+                                            next_batch_idx = (next_batch_idx + 1) % batches_len;
+                                        };
+                                    }
+                                }
+                            },
                             EType::Book => {
                                 let asset_id = e_data["asset_id"].as_str().context("Asset id not found")?;
-                                let orderbook = assets_ids.get_mut(asset_id).context("Invalid asset id")?;
+                                let Some(orderbook) = assets_ids.get_mut(asset_id) else {
+                                    continue;
+                                };
+
                                 let timestamp = e_data["timestamp"]
                                     .as_str()
                                     .context("Timestamp not found")?;

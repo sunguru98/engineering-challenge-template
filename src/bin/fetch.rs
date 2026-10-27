@@ -1,6 +1,6 @@
 use rand::RngExt;
 
-pub const URL: &'static str = "https://gamma-api.polymarket.com/markets/keyset";
+pub const URL: &'static str = "https://gamma-api.polymarket.com/events/keyset";
 
 pub async fn fetch_page(
     client: &reqwest::Client,
@@ -14,57 +14,58 @@ pub async fn fetch_page(
         .as_str()
         .and_then(|v| Some(v.to_owned()));
 
-    let markets = data["markets"]
+    let events = data["events"]
         .as_array()
-        .ok_or_else(|| anyhow::anyhow!("Markets not found"))?;
+        .ok_or_else(|| anyhow::anyhow!("Events not found"))?;
 
-    let mut skip_counter = 0;
     let mut token_ids: Vec<String> = vec![];
-    for market in markets {
-        let mut index = 0usize;
-        if let Some(outcomes) = market["outcomes"].as_str() {
-            let outcomes = serde_json::from_str::<Vec<&str>>(outcomes)?;
-            index = if outcomes[0] == "Yes" { 0 } else { 1 }
-        }
+    for event in events {
+        let markets = event["markets"]
+            .as_array()
+            .ok_or_else(|| anyhow::anyhow!("Markets not found"))?;
 
-        let is_active = market["active"].as_bool();
-        let is_closed = market["closed"].as_bool();
-        let is_orderbook_enabled = market["enableOrderBook"].as_bool();
-        let is_accepting_orders = market["acceptingOrders"].as_bool();
+        for market in markets {
+            // let mut index = 0usize;
+            // if let Some(outcomes) = market["outcomes"].as_array() {
+            //     let outcomes = serde_json::from_str::<Vec<&str>>(outcomes)?;
+            //     if let Some(yes_outcome_position) = outcomes.iter().position(|&o| o == "Yes") {
+            //         index = yes_outcome_position;
+            //     } else {
+            //         continue;
+            //     }
+            // }
 
-        if is_active == Some(true)
-            && is_closed == Some(false)
-            && is_accepting_orders == Some(true)
-            && is_orderbook_enabled == Some(true)
-        {
-            let clob_token_ids = market["clobTokenIds"].as_str();
-            if clob_token_ids.is_none() {
-                skip_counter += 1;
-                continue;
+            let is_active = market["active"].as_bool();
+            let is_closed = market["closed"].as_bool();
+            let is_orderbook_enabled = market["enableOrderBook"].as_bool();
+            let is_accepting_orders = market["acceptingOrders"].as_bool();
+
+            if is_active == Some(true)
+                && is_closed == Some(false)
+                && is_accepting_orders == Some(true)
+                && is_orderbook_enabled == Some(true)
+            {
+                let clob_token_ids = market["clobTokenIds"].as_str();
+                if clob_token_ids.is_none() {
+                    continue;
+                }
+
+                let Ok(mut clob_token_ids) =
+                    serde_json::from_str::<Vec<String>>(clob_token_ids.unwrap())
+                else {
+                    continue;
+                };
+
+                if clob_token_ids.len() != 2 {
+                    continue;
+                }
+
+                token_ids.push(clob_token_ids.swap_remove(0));
             }
-
-            let Ok(mut clob_token_ids) =
-                serde_json::from_str::<Vec<String>>(clob_token_ids.unwrap())
-            else {
-                skip_counter += 1;
-                continue;
-            };
-
-            if clob_token_ids.len() != 2 {
-                skip_counter += 1;
-                continue;
-            }
-
-            token_ids.push(clob_token_ids.swap_remove(index));
         }
     }
 
-    println!(
-        "{} tokens from {} markets, {} skipped",
-        token_ids.len(),
-        markets.len(),
-        skip_counter
-    );
+    println!("{} tokens from {} events", token_ids.len(), events.len());
 
     println!("Next cursor: {next_cursor:?}");
     return Ok((token_ids, next_cursor));
@@ -110,10 +111,6 @@ pub async fn fetch_all_markets(buf_writer: &mut impl std::io::Write) -> anyhow::
 
     loop {
         let (token_ids, next_cursor) = fetch_markets(&client, &query_params).await?;
-        if next_cursor.is_some() && token_ids.is_empty() {
-            break;
-        }
-
         for id in token_ids {
             writeln!(buf_writer, "{id}")?;
         }
