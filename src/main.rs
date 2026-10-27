@@ -198,12 +198,6 @@ async fn main() -> anyhow::Result<()> {
 
     let mut join_set: JoinSet<anyhow::Result<usize>> = tokio::task::JoinSet::new();
     for (batch_idx, batch) in batches.into_iter().enumerate() {
-        let payload = serde_json::to_string(&SubscriptionPayload {
-            assets_ids: batch,
-            r#type: "market",
-            custom_feature_enabled: true,
-        })?;
-
         let (event_sender, mut event_receiver) = tokio::sync::mpsc::channel::<UpdateEvents>(100);
         batch_sender_map.insert(batch_idx, event_sender);
         let mut event_sender_closed = false;
@@ -216,6 +210,11 @@ async fn main() -> anyhow::Result<()> {
             let mut delay_seconds = std::time::Duration::from_secs(1);
             let maximum_delay_seconds = std::time::Duration::from_secs(30);
 
+            let mut worker_payload: HashMap<String, usize> = HashMap::new();
+            for key in batch.into_iter() {
+                worker_payload.insert(key, batch_idx);
+            }
+
             loop {
                 let result: anyhow::Result<()> = async {
                     let (stream, _) = tokio_tungstenite::connect_async(
@@ -224,6 +223,12 @@ async fn main() -> anyhow::Result<()> {
                     .await?;
 
                     let (mut write, mut read) = stream.split();
+
+                    let payload = serde_json::to_string(&SubscriptionPayload {
+                        assets_ids: worker_payload.keys().map(String::from).collect(),
+                        r#type: "market",
+                        custom_feature_enabled: true,
+                    })?;
 
                     write
                         .send(tokio_tungstenite::tungstenite::Message::Text(
@@ -259,7 +264,10 @@ async fn main() -> anyhow::Result<()> {
                                                     \"operation\": \"unsubscribe\",
                                                     \"assets_ids\": {}
                                                 }}"#, serde_json::to_string(&asset_ids)?).into()).await?;
-                                                println!("Unsubscribed market of {asset_ids:?} succesfully")
+                                                println!("Unsubscribed market of {asset_ids:?} succesfully");
+                                                for id in asset_ids {
+                                                    worker_payload.remove(&id);
+                                                }
                                             },
                                             UpdateEvents::NewMarket { asset_ids } => {
                                                 write.send(format!(r#"
@@ -267,7 +275,10 @@ async fn main() -> anyhow::Result<()> {
                                                     \"operation\": \"subscribe\",
                                                     \"assets_ids\": {}
                                                 }}"#, serde_json::to_string(&asset_ids)?).into()).await?;
-                                                println!("New market of {asset_ids:?} added succesfully")
+                                                println!("New market of {asset_ids:?} added succesfully");
+                                                for id in asset_ids {
+                                                    worker_payload.insert(id, batch_idx);
+                                                }
                                             }
                                         }
                                     },
