@@ -11,8 +11,8 @@ const SCHEMA: &str = "sbe_schemas/engineering_challenge/challenge_orderbook.yaml
 const COMMON_TYPES: &str = "sbe_schemas/includes/common-types.xml";
 
 fn main() -> Result<()> {
-    println!("cargo::rerun-if-changed={SCHEMA}");
-    println!("cargo::rerun-if-changed={COMMON_TYPES}");
+    eprintln!("cargo::rerun-if-changed={SCHEMA}");
+    eprintln!("cargo::rerun-if-changed={COMMON_TYPES}");
 
     let yaml = fs::read_to_string(SCHEMA).into_diagnostic()?;
     let schema = sbe_yaml::parse(&yaml).map_err(|error| miette!("{error}"))?;

@@ -9,31 +9,36 @@ use tokio::{
     time::interval,
 };
 
-const CHUNK_SIZE_64_MEBIBYTES: usize = 64 << 20;
-const WORKER_CHANNEL_SIZE: usize = 25_000;
-const UPDATE_EVENT_CHANNEL_SIZE: usize = 10_000;
-
 mod assets;
+mod constants;
 mod handlers;
 mod orderbook;
 mod parse;
+mod tokens;
 mod types;
 mod worker;
 
 use assets::fetch_asset_ids;
+use constants::CHUNK_SIZE_64_MEBIBYTES;
 use orderbook::take_snapshot;
+use tokens::fetch_all_markets;
 use types::EType;
 use worker::run_worker;
 
+use crate::constants::{UPDATE_EVENT_CHANNEL_SIZE, WORKER_CHANNEL_SIZE};
+
 #[tokio::main]
 async fn main() -> Result<()> {
-    let file = std::path::Path::new("data.bin");
+    let token_ids = fetch_all_markets().await?;
+    eprintln!("Fetched {} tokens/asset_ids from events", token_ids.len());
+
+    let file = std::path::Path::new("/dev/stdout");
     let mut writer = AlignedSbeWriter::create(file, CHUNK_SIZE_64_MEBIBYTES)?;
 
-    let (mut assets_ids, batches, mut asset_worker_map) = fetch_asset_ids()?;
-    println!("Total assets: {}", assets_ids.len());
+    let (mut assets_ids, batches, mut asset_worker_map) = fetch_asset_ids(token_ids)?;
+    eprintln!("Total assets: {}", assets_ids.len());
     let batches_len = batches.len();
-    println!("Total batches: {batches_len}");
+    eprintln!("Total batches: {batches_len}");
 
     let mut batch_sender_map = HashMap::new();
 
@@ -75,23 +80,23 @@ async fn main() -> Result<()> {
 
         tokio::select! {
             _ = &mut sigint, if !shutting_down => {
-                println!("\nCommencing Shutdown");
+                eprintln!("\nCommencing Shutdown");
                 signal_sender.send(true)?;
                 shutting_down = true;
             }
 
             _ = interval.tick() => {
-                println!("Creating a snapshot at {}", Utc::now());
+                eprintln!("Creating a snapshot at {}", Utc::now());
                 take_snapshot(&assets_ids, &mut writer)?;
             }
 
             join_result = join_set.join_next(), if shutting_down && !work_complete => {
                 match join_result {
-                    Some(Ok(Ok(batch_idx))) => println!("Websocket #{batch_idx} finished running"),
+                    Some(Ok(Ok(batch_idx))) => eprintln!("Websocket #{batch_idx} finished running"),
                     Some(Ok(Err(err))) => eprintln!("Websocket finished with error: {err:?}"),
                     Some(Err(err)) => eprintln!("Task returned with error: {err:?}"),
                     None => {
-                        println!("All websockets closed");
+                        eprintln!("All websockets closed");
                         work_complete = true
                     }
                 }

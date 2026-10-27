@@ -31,7 +31,6 @@ pub async fn handle_market_resolved(
             continue;
         };
 
-        println!("Marking {id} as resolved to batch #{batch_idx}");
         sender
             .send(UpdateEvents::MarketResolved {
                 asset_ids: vec![id.clone()],
@@ -55,7 +54,6 @@ pub async fn handle_new_market(
     let Some(asset_id) = extract_asset_id(e_data)? else {
         return Ok(());
     };
-    println!("New market notified of asset_id: {asset_id}");
 
     if assets_ids.contains_key(&asset_id) {
         return Ok(());

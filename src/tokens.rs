@@ -1,12 +1,12 @@
 use rand::RngExt;
 
-pub const URL: &str = "https://gamma-api.polymarket.com/events/keyset";
+use crate::constants::{HTTP_URL, MAX_ATTEMPTS};
 
-pub async fn fetch_page(
+async fn fetch_page(
     client: &reqwest::Client,
     query_params: &std::collections::HashMap<&str, String>,
 ) -> anyhow::Result<(Vec<String>, Option<String>)> {
-    let response = client.get(URL).query(query_params).send().await?;
+    let response = client.get(HTTP_URL).query(query_params).send().await?;
     let response = response.error_for_status()?;
 
     let data = response.json::<serde_json::Value>().await?;
@@ -51,13 +51,11 @@ pub async fn fetch_page(
         }
     }
 
-    println!("{} tokens from {} events", token_ids.len(), events.len());
-
-    println!("Next cursor: {next_cursor:?}");
+    eprintln!("{} tokens from {} events", token_ids.len(), events.len());
     return Ok((token_ids, next_cursor));
 }
 
-pub async fn fetch_markets(
+async fn fetch_markets(
     client: &reqwest::Client,
     query_params: &std::collections::HashMap<&str, String>,
 ) -> anyhow::Result<(Vec<String>, Option<String>)> {
@@ -66,7 +64,7 @@ pub async fn fetch_markets(
     let maximum_delay_seconds = std::time::Duration::from_secs(30);
 
     loop {
-        if attempt_number > 20 {
+        if attempt_number > MAX_ATTEMPTS {
             anyhow::bail!("Connection failed");
         }
 
@@ -87,21 +85,18 @@ pub async fn fetch_markets(
     }
 }
 
-pub async fn fetch_all_markets(buf_writer: &mut impl std::io::Write) -> anyhow::Result<()> {
+pub async fn fetch_all_markets() -> anyhow::Result<Vec<String>> {
     let mut query_params: std::collections::HashMap<&str, String> =
         std::collections::HashMap::new();
     query_params.insert("closed", "false".to_string());
     query_params.insert("limit", "100".to_string());
 
     let client = reqwest::Client::new();
+    let mut all_token_ids = vec![];
 
     loop {
-        let (token_ids, next_cursor) = fetch_markets(&client, &query_params).await?;
-        for id in token_ids {
-            writeln!(buf_writer, "{id}")?;
-        }
-
-        buf_writer.flush()?;
+        let (mut token_ids, next_cursor) = fetch_markets(&client, &query_params).await?;
+        all_token_ids.append(&mut token_ids);
 
         let Some(next_cursor) = next_cursor.filter(|c| !c.is_empty()) else {
             break;
@@ -109,16 +104,5 @@ pub async fn fetch_all_markets(buf_writer: &mut impl std::io::Write) -> anyhow::
         query_params.insert("after_cursor", next_cursor);
     }
 
-    Ok(())
-}
-
-#[tokio::main]
-pub async fn main() -> anyhow::Result<()> {
-    let file = std::fs::File::create("token_ids.txt.tmp")?;
-    let mut buf_writer = std::io::BufWriter::new(file);
-    fetch_all_markets(&mut buf_writer).await?;
-
-    std::fs::rename("token_ids.txt.tmp", "token_ids.txt")?;
-
-    Ok(())
+    Ok(all_token_ids)
 }

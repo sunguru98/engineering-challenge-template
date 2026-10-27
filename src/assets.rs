@@ -1,8 +1,6 @@
 use std::collections::HashMap;
 
-use crate::orderbook::Orderbook;
-
-pub const BATCH_SIZE: usize = 5_000;
+use crate::{constants::BATCH_SIZE, orderbook::Orderbook};
 
 pub fn extract_asset_id(market: &serde_json::Value) -> anyhow::Result<Option<String>> {
     if market["active"].as_bool() != Some(true) {
@@ -17,12 +15,13 @@ pub fn extract_asset_id(market: &serde_json::Value) -> anyhow::Result<Option<Str
     Ok(ids[0].as_str().map(String::from))
 }
 
-pub fn fetch_asset_ids() -> anyhow::Result<(
+pub fn fetch_asset_ids(
+    token_ids: Vec<String>,
+) -> anyhow::Result<(
     HashMap<String, Orderbook>,
     Vec<Vec<String>>,
     HashMap<String, usize>,
 )> {
-    let token_ids = std::fs::read_to_string("token_ids.txt")?;
     let mut assets_ids = std::collections::HashMap::new();
 
     let mut batches: Vec<Vec<String>> = vec![];
@@ -32,7 +31,7 @@ pub fn fetch_asset_ids() -> anyhow::Result<(
     let mut batch_idx = 0usize;
     let mut asset_batch_map = HashMap::new();
 
-    for token_id in token_ids.lines().map(String::from) {
+    for token_id in token_ids {
         batch.push(token_id.clone());
         asset_batch_map.insert(token_id.clone(), batch_idx);
         if batch_counter == BATCH_SIZE {
