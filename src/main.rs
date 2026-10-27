@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::time::Duration;
 
 use anyhow::Context;
 use engineering_challenge::util::AlignedSbeWriter;
@@ -79,6 +80,41 @@ pub struct Orderbook {
     pub timestamp: chrono::DateTime<chrono::Utc>,
     pub bids: std::collections::BTreeMap<i64, i64>,
     pub asks: std::collections::BTreeMap<i64, i64>,
+}
+
+pub fn take_snapshot(
+    assets_ids: &HashMap<String, Orderbook>,
+    writer: &mut AlignedSbeWriter,
+) -> anyhow::Result<()> {
+    for (asset_id, orderbook) in assets_ids.iter() {
+        let mut asks = vec![];
+        for (price_level, quantity) in orderbook.asks.iter() {
+            asks.push(SnapshotAsksEntryDomain {
+                price_level: *price_level,
+                quantity: *quantity,
+            })
+        }
+
+        let mut bids = vec![];
+        for (price_level, quantity) in orderbook.bids.iter().rev() {
+            bids.push(SnapshotBidsEntryDomain {
+                price_level: *price_level,
+                quantity: *quantity,
+            })
+        }
+
+        let snapshot = SnapshotDomain {
+            asks,
+            bids,
+            exchange_timestamp: orderbook.timestamp,
+            received_at: chrono::Utc::now(),
+            symbol: asset_id.to_owned(),
+        };
+        // println!("{snapshot:?}");
+        writer.write_msg(&snapshot)?;
+    }
+
+    Ok(())
 }
 
 pub fn extract_asset_id(market: &serde_json::Value) -> anyhow::Result<Option<String>> {
@@ -198,7 +234,7 @@ async fn main() -> anyhow::Result<()> {
 
     let mut join_set: JoinSet<anyhow::Result<usize>> = tokio::task::JoinSet::new();
     for (batch_idx, batch) in batches.into_iter().enumerate() {
-        let (event_sender, mut event_receiver) = tokio::sync::mpsc::channel::<UpdateEvents>(100);
+        let (event_sender, mut event_receiver) = tokio::sync::mpsc::channel::<UpdateEvents>(10_000);
         batch_sender_map.insert(batch_idx, event_sender);
         let mut event_sender_closed = false;
 
@@ -216,6 +252,8 @@ async fn main() -> anyhow::Result<()> {
             }
 
             loop {
+                let connected_at = std::time::Instant::now();
+
                 let result: anyhow::Result<()> = async {
                     let (stream, _) = tokio_tungstenite::connect_async(
                         "wss://ws-subscriptions-clob.polymarket.com/ws/market",
@@ -259,22 +297,22 @@ async fn main() -> anyhow::Result<()> {
                                     Some(update_event) => {
                                         match update_event {
                                             UpdateEvents::MarketResolved { asset_ids } => {
-                                                write.send(format!(r#"
-                                                {{
-                                                    \"operation\": \"unsubscribe\",
-                                                    \"assets_ids\": {}
-                                                }}"#, serde_json::to_string(&asset_ids)?).into()).await?;
+                                                let payload = serde_json::json!({
+                                                    "operation": "unsubscribe",
+                                                    "assets_ids": asset_ids,
+                                                });
+                                                write.send(payload.to_string().into()).await?;
                                                 println!("Unsubscribed market of {asset_ids:?} succesfully");
                                                 for id in asset_ids {
                                                     worker_payload.remove(&id);
                                                 }
                                             },
                                             UpdateEvents::NewMarket { asset_ids } => {
-                                                write.send(format!(r#"
-                                                {{
-                                                    \"operation\": \"subscribe\",
-                                                    \"assets_ids\": {}
-                                                }}"#, serde_json::to_string(&asset_ids)?).into()).await?;
+                                                let payload = serde_json::json!({
+                                                    "operation": "subscribe",
+                                                    "assets_ids": asset_ids,
+                                                });
+                                                write.send(payload.to_string().into()).await?;
                                                 println!("New market of {asset_ids:?} added succesfully");
                                                 for id in asset_ids {
                                                     worker_payload.insert(id, batch_idx);
@@ -339,6 +377,11 @@ async fn main() -> anyhow::Result<()> {
                     eprintln!("Connection error: {err}")
                 }
 
+                if connected_at.elapsed() > Duration::from_secs(60) {
+                    attempt_number = 1;
+                    delay_seconds = std::time::Duration::from_secs(1);
+                }
+
                 if *signal_receiver.borrow() {
                     println!("Shutting down websocket batch #{batch_idx}");
                     break;
@@ -392,33 +435,7 @@ async fn main() -> anyhow::Result<()> {
 
             _ = interval.tick() => {
                 println!("Creating a snapshot at {}", chrono::Utc::now());
-                for (asset_id, orderbook) in assets_ids.iter() {
-                    let mut asks = vec![];
-                    for (price_level, quantity) in orderbook.asks.iter() {
-                        asks.push(SnapshotAsksEntryDomain {
-                            price_level: *price_level,
-                            quantity: *quantity,
-                        })
-                    }
-
-                    let mut bids = vec![];
-                    for (price_level, quantity) in orderbook.bids.iter().rev() {
-                        bids.push(SnapshotBidsEntryDomain {
-                            price_level: *price_level,
-                            quantity: *quantity,
-                        })
-                    }
-
-                    let snapshot = SnapshotDomain {
-                        asks,
-                        bids,
-                        exchange_timestamp: orderbook.timestamp,
-                        received_at: chrono::Utc::now(),
-                        symbol: asset_id.to_owned(),
-                    };
-                    // println!("{snapshot:?}");
-                    writer.write_msg(&snapshot)?;
-                }
+                take_snapshot(&assets_ids, &mut writer)?;
             }
 
             join_result = join_set.join_next(), if shutting_down && !work_complete => {
@@ -517,19 +534,28 @@ async fn main() -> anyhow::Result<()> {
                                     let bid_size = convert_to_schema_int(&bid.size)?;
                                     orderbook.bids.insert(bid_price, bid_size);
                                 }
+
+                                take_snapshot(&assets_ids, &mut writer)?;
                             }
                             EType::PriceChange => {
                                 let mut price_change_event = PriceChangeEvent::deserialize(&e_data)?;
                                 for pc in price_change_event.price_changes.iter_mut() {
                                     if let Some(orderbook) = assets_ids.get_mut(&pc.asset_id) {
-                                        let price_level = convert_to_schema_int(&pc.price)?;
-                                        let quantity = convert_to_schema_int(&pc.size)?;
+                                        let Ok(price_level) = convert_to_schema_int(&pc.price) else {
+                                            eprintln!("Invalid price: {}", pc.price);
+                                            continue
+                                        };
+                                        let Ok(quantity) = convert_to_schema_int(&pc.size) else {
+                                            eprintln!("Invalid price: {}", pc.price);
+                                            continue
+                                        };
+
                                         let side = if &pc.side == "SELL" {
                                             engineering_challenge::Side::Sell
                                         } else if &pc.side == "BUY" {
                                             engineering_challenge::Side::Buy
                                         } else {
-                                            anyhow::bail!("Invalid side");
+                                            continue;
                                         };
 
                                         let exchange_timestamp = chrono::DateTime::from_timestamp_millis(

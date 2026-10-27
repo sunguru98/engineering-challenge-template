@@ -25,16 +25,6 @@ pub async fn fetch_page(
             .ok_or_else(|| anyhow::anyhow!("Markets not found"))?;
 
         for market in markets {
-            // let mut index = 0usize;
-            // if let Some(outcomes) = market["outcomes"].as_array() {
-            //     let outcomes = serde_json::from_str::<Vec<&str>>(outcomes)?;
-            //     if let Some(yes_outcome_position) = outcomes.iter().position(|&o| o == "Yes") {
-            //         index = yes_outcome_position;
-            //     } else {
-            //         continue;
-            //     }
-            // }
-
             let is_active = market["active"].as_bool();
             let is_closed = market["closed"].as_bool();
             let is_orderbook_enabled = market["enableOrderBook"].as_bool();
