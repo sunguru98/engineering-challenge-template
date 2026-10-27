@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::HashSet;
 use std::time::Duration;
 
 use anyhow::Context;
@@ -11,7 +11,7 @@ use tokio::{
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 
 use crate::{
-    constants::WS_URL,
+    constants::{HEARTBEAT_TIMER_SECONDS, WS_URL},
     types::{EType, Event, SubscriptionPayload, UpdateEvents},
 };
 
@@ -28,10 +28,13 @@ pub async fn run_worker(
     let mut delay_seconds = std::time::Duration::from_secs(1);
     let maximum_delay_seconds = std::time::Duration::from_secs(30);
 
-    let mut worker_payload: HashMap<String, usize> = HashMap::new();
+    let mut worker_payload: HashSet<String> = HashSet::new();
     for key in batch.into_iter() {
-        worker_payload.insert(key, batch_idx);
+        worker_payload.insert(key);
     }
+
+    let mut heartbeat_interval = interval(Duration::from_secs(HEARTBEAT_TIMER_SECONDS));
+    heartbeat_interval.tick().await;
 
     loop {
         let connected_at = std::time::Instant::now();
@@ -45,9 +48,10 @@ pub async fn run_worker(
             let (mut write, mut read) = stream.split();
 
             let payload = serde_json::to_string(&SubscriptionPayload {
-                assets_ids: worker_payload.keys().map(String::from).collect(),
+                assets_ids: worker_payload.iter().map(String::from).collect(),
                 r#type: "market",
                 custom_feature_enabled: true,
+                initial_dump: true,
             })?;
 
             write
@@ -58,9 +62,6 @@ pub async fn run_worker(
 
             eprintln!("Subscription done for websocket batch #{batch_idx} :)");
 
-            let mut heartbeat_interval =
-                interval(Duration::from_secs(10));
-            heartbeat_interval.tick().await;
 
             loop {
                 tokio::select! {
@@ -96,7 +97,7 @@ pub async fn run_worker(
                                         write.send(payload.to_string().into()).await?;
                                         eprintln!("New market of {asset_ids:?} added succesfully");
                                         for id in asset_ids {
-                                            worker_payload.insert(id, batch_idx);
+                                            worker_payload.insert(id);
                                         }
                                     }
                                 }

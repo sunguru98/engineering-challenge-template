@@ -25,7 +25,7 @@ use tokens::fetch_all_markets;
 use types::EType;
 use worker::run_worker;
 
-use crate::constants::{UPDATE_EVENT_CHANNEL_SIZE, WORKER_CHANNEL_SIZE};
+use crate::constants::{SNAPSHOT_TIME_SECONDS, UPDATE_EVENT_CHANNEL_SIZE, WORKER_CHANNEL_SIZE};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -63,7 +63,7 @@ async fn main() -> Result<()> {
     }
     drop(sender);
 
-    let mut interval = interval(Duration::from_secs(60));
+    let mut interval = interval(Duration::from_secs(SNAPSHOT_TIME_SECONDS));
     interval.tick().await;
 
     let mut shutting_down = false;
@@ -137,7 +137,7 @@ async fn main() -> Result<()> {
                                 }
                             }
                             EType::Book => {
-                                if let Err(err) = handlers::handle_book(&mut assets_ids, &mut writer, &e_data) {
+                                if let Err(err) = handlers::handle_book(&mut assets_ids, &e_data) {
                                     eprintln!("Skipping bad book event: {err:#}");
                                 }
                             }

@@ -8,7 +8,7 @@ use serde::Deserialize;
 use tokio::sync::mpsc;
 
 use crate::assets::extract_asset_id;
-use crate::orderbook::{Orderbook, write_snapshot};
+use crate::orderbook::Orderbook;
 use crate::parse::convert_to_schema_int;
 use crate::types::{BookEvent, MarketResolvedEvent, PriceChangeEvent, UpdateEvents};
 
@@ -79,7 +79,6 @@ pub async fn handle_new_market(
 
 pub fn handle_book(
     assets_ids: &mut HashMap<String, Orderbook>,
-    writer: &mut AlignedSbeWriter,
     e_data: &serde_json::Value,
 ) -> anyhow::Result<()> {
     let book_event = BookEvent::deserialize(e_data)?;
@@ -110,7 +109,7 @@ pub fn handle_book(
     orderbook.asks = asks;
     orderbook.bids = bids;
 
-    write_snapshot(&book_event.asset_id, orderbook, writer)
+    Ok(())
 }
 
 pub fn handle_price_change(

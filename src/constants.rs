@@ -5,3 +5,5 @@ pub const CHUNK_SIZE_64_MEBIBYTES: usize = 64 << 20;
 pub const WORKER_CHANNEL_SIZE: usize = 50_000;
 pub const UPDATE_EVENT_CHANNEL_SIZE: usize = 10_000;
 pub const BATCH_SIZE: usize = 2_500;
+pub const HEARTBEAT_TIMER_SECONDS: u64 = 10;
+pub const SNAPSHOT_TIME_SECONDS: u64 = 60;

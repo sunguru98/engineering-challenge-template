@@ -1,21 +1,58 @@
-# Read before getting started!!
+# Voluntas Engineering Challenge
 
-First, read [src/main.rs](https://github.com/voluntas-io/engineering-challenge/blob/main/src/main.rs). Then, some background on this repo:
+## Architecture (Code flow)
 
-This repo uses the [FIX SBE standard](https://fixtrading.org/packages/simple-binary-encoding-technical-specification-v2-rc2/)
-for writing binary messages. The rust code abstracts this away for you, and you can simply use the helpers, as demonstrated in `main.rs`.
+```text
+              Polymarket
+                   |
+            Asset fetching
+                   |
+            Asset batches
+                   |
+          WebSocket workers (tokio join_set)
+                   |
+            Market events
+                   |
+          Event processing
+                   |
+           Order-book state
+              /         \
+             /           \
+     Price Change       Full snapshot
+        Events         every 60 seconds
+          |                  |
+          |                  |
+          +--------+---------+
+                   |
+      Coordinated Shutdown (SIGINT)
+                   |
+           SBE serialization
+                   |
+                stdout
+                   |
+            Captured data file
+```
 
-### More background, in case you are curious!
+## Core logic files
 
-FIX SBE is defined in XML, which I find extremely cumbersome to edit, especially
-when updating schemas frequently. To solve this, I have also introduced some
-helper code that takes our own custom YAML format, and turns it into FIX SBE
-XML, which in turn is used to generate rust code to encode and decode the
-messages. **You don't need to edit any of these files**. This explanation is
-simply to help you understand the origins of the various files in this repo.
+| File | Function |
+|---|---|
+| `src/main.rs` | Application entry point and orchestration |
+| `src/worker.rs` | WebSocket worker and subscription handling |
+| `src/handlers.rs` | Incoming market-event processing |
+| `src/orderbook.rs` | Orderbook struct and snapshot related functions |
+| `src/tokens.rs` | Asset fetching through HTTP cursor based pagination |
 
-If you're curious to see the YAML schema, take a look at [challenge_orderbook.yaml](https://github.com/voluntas-io/engineering-challenge/blob/main/sbe_schemas/engineering_challenge/challenge_orderbook.yaml).
-We also use a custom timestamp field, so that the Rust struct can use
-`chrono::DateTime` in the generated struct, and in SBE schema, it is a uint64
-representing the timestamp as the number of microseconds since unix epoch.
+The supplied schema and serialization helpers are used to keep the output compatible with the challenge's expected format.
 
+## Build and run
+
+```bash
+cargo build --release
+```
+
+Run the application:
+
+```bash
+cargo run --release > /path_to_data.bin
+```

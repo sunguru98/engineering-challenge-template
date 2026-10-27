@@ -3,6 +3,7 @@ pub struct SubscriptionPayload {
     pub assets_ids: Vec<String>,
     pub r#type: &'static str,
     pub custom_feature_enabled: bool,
+    pub initial_dump: bool,
 }
 
 #[derive(serde::Serialize, serde::Deserialize, Debug)]
