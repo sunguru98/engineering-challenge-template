@@ -1,6 +1,6 @@
 use rand::RngExt;
 
-pub const URL: &'static str = "https://gamma-api.polymarket.com/events/keyset";
+pub const URL: &str = "https://gamma-api.polymarket.com/events/keyset";
 
 pub async fn fetch_page(
     client: &reqwest::Client,
@@ -10,9 +10,7 @@ pub async fn fetch_page(
     let response = response.error_for_status()?;
 
     let data = response.json::<serde_json::Value>().await?;
-    let next_cursor = data["next_cursor"]
-        .as_str()
-        .and_then(|v| Some(v.to_owned()));
+    let next_cursor = data["next_cursor"].as_str().map(str::to_owned);
 
     let events = data["events"]
         .as_array()
@@ -35,13 +33,11 @@ pub async fn fetch_page(
                 && is_accepting_orders == Some(true)
                 && is_orderbook_enabled == Some(true)
             {
-                let clob_token_ids = market["clobTokenIds"].as_str();
-                if clob_token_ids.is_none() {
+                let Some(clob_token_ids) = market["clobTokenIds"].as_str() else {
                     continue;
-                }
+                };
 
-                let Ok(mut clob_token_ids) =
-                    serde_json::from_str::<Vec<String>>(clob_token_ids.unwrap())
+                let Ok(mut clob_token_ids) = serde_json::from_str::<Vec<String>>(clob_token_ids)
                 else {
                     continue;
                 };
@@ -107,15 +103,9 @@ pub async fn fetch_all_markets(buf_writer: &mut impl std::io::Write) -> anyhow::
 
         buf_writer.flush()?;
 
-        if next_cursor.is_none() {
+        let Some(next_cursor) = next_cursor.filter(|c| !c.is_empty()) else {
             break;
-        }
-
-        let next_cursor = next_cursor.unwrap();
-        if next_cursor.is_empty() {
-            break;
-        }
-
+        };
         query_params.insert("after_cursor", next_cursor);
     }
 

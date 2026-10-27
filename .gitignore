@@ -1,4 +1,5 @@
 /target/
 token_ids.txt
+token_ids.txt.tmp
 *.json
 *.bin
