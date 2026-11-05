@@ -1,3 +1,5 @@
+use chrono::{DateTime, Utc};
+
 #[derive(serde::Serialize)]
 pub struct SubscriptionPayload {
     pub assets_ids: Vec<String>,
@@ -52,6 +54,7 @@ pub enum EType {
 pub struct Event {
     pub e_type: EType,
     pub data: serde_json::Value,
+    pub received_at: DateTime<Utc>,
 }
 
 #[derive(Debug)]

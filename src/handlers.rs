@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, HashMap};
 
 use anyhow::Context;
+use chrono::{DateTime, Utc};
 use engineering_challenge::Side;
 use engineering_challenge::util::AlignedSbeWriter;
 use engineering_challenge::util::dtos::challenge_orderbook::PriceLevelUpdateDomain;
@@ -116,6 +117,7 @@ pub fn handle_price_change(
     assets_ids: &mut HashMap<String, Orderbook>,
     writer: &mut AlignedSbeWriter,
     e_data: &serde_json::Value,
+    backtest_timestamp: DateTime<Utc>,
 ) -> anyhow::Result<()> {
     let event = PriceChangeEvent::deserialize(e_data)?;
     let exchange_timestamp = chrono::DateTime::from_timestamp_millis(event.timestamp.parse()?)
@@ -153,7 +155,7 @@ pub fn handle_price_change(
 
         writer.write_msg(&PriceLevelUpdateDomain {
             exchange_timestamp,
-            backtest_timestamp: chrono::Utc::now(),
+            backtest_timestamp,
             price_level,
             quantity,
             side,

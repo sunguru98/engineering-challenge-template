@@ -2,11 +2,12 @@ use std::collections::HashSet;
 use std::time::Duration;
 
 use anyhow::Context;
+use chrono::Utc;
 use futures_util::{SinkExt, StreamExt};
 use rand::RngExt;
 use tokio::{
     sync::{mpsc, watch},
-    time::interval,
+    time::{interval, timeout},
 };
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 
@@ -61,12 +62,33 @@ pub async fn run_worker(
                 .await?;
 
             eprintln!("Subscription done for websocket batch #{batch_idx} :)");
-
-
+            
             loop {
                 tokio::select! {
                     _ = signal_receiver.changed() => {
                         if *signal_receiver.borrow() {
+                            if let Err(err) = write.send(Message::Close(None)).await {
+                                eprintln!("Shutdown close frame error: {err:?}");
+                                break;
+                            }
+
+                            let timeout_res = timeout(Duration::from_secs(2), async {
+                                while let Some(response) = read.next().await {
+                                    match response {
+                                        Ok(Message::Close(_)) =>  {
+                                            eprintln!("Websocket #{batch_idx} closed succesfully");
+                                            break;
+                                        }
+                                        Ok(_) => continue,
+                                        Err(_) => break,
+                                    }
+                                }
+                            }).await;
+
+                            if let Err(_) = timeout_res {
+                                eprintln!("Websocket #{batch_idx} shutdown reply timed out")
+                            }
+
                             break;
                         }
                     }
@@ -122,6 +144,7 @@ pub async fn run_worker(
                                         _ => vec![],
                                     };
 
+                                    let received_at = Utc::now();
                                     for event in events {
                                         let event_type = event["event_type"]
                                             .as_str()
@@ -139,6 +162,7 @@ pub async fn run_worker(
                                         let block_event = Event {
                                             data: event,
                                             e_type: event_type,
+                                            received_at,
                                         };
 
                                         sender.send(block_event).await?;

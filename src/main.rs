@@ -145,7 +145,8 @@ async fn main() -> Result<()> {
                                 if let Err(err) = handlers::handle_price_change(
                                     &mut assets_ids,
                                     &mut writer,
-                                    &e_data
+                                    &e_data,
+                                    event.received_at,
                                 ) {
                                     eprintln!("Skipping bad price_change event: {err:#}");
                                 }
