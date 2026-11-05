@@ -12,8 +12,7 @@ use tokio::{
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 
 use crate::{
-    constants::{HEARTBEAT_TIMER_SECONDS, WS_URL},
-    types::{EType, Event, SubscriptionPayload, UpdateEvents},
+    constants::{HEARTBEAT_TIMER_SECONDS, MAX_ATTEMPTS, STABLE_CHECK_SECONDS, WS_URL}, types::{EType, Event, SubscriptionPayload, UpdateEvents},
 };
 
 pub async fn run_worker(
@@ -183,7 +182,7 @@ pub async fn run_worker(
             Err(err) => eprintln!("Connection error: {err}"),
         }
 
-        if connected_at.elapsed() > Duration::from_secs(60) {
+        if connected_at.elapsed() > Duration::from_secs(STABLE_CHECK_SECONDS) {
             attempt_number = 0;
             delay_seconds = Duration::from_secs(1);
         }
@@ -202,7 +201,7 @@ pub async fn run_worker(
         delay_seconds = (delay_seconds * 2).min(maximum_delay_seconds);
         attempt_number += 1;
 
-        if attempt_number > 20 {
+        if attempt_number > MAX_ATTEMPTS {
             anyhow::bail!("Connection failed");
         }
     }

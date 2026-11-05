@@ -6,9 +6,17 @@ pub fn extract_asset_id(market: &serde_json::Value) -> anyhow::Result<Option<Str
     if market["active"].as_bool() != Some(true) {
         return Ok(None);
     }
-    let Some(ids) = market["clob_token_ids"].as_array() else {
-        return Ok(None);
+
+    let ids = match market["clob_token_ids"].as_array() {
+        Some(ids) => ids,
+        None => {
+            let Some(asset_ids) = market["assets_ids"].as_array() else {
+                return Ok(None);
+            };
+            asset_ids
+        }
     };
+
     if ids.len() != 2 {
         return Ok(None);
     }
@@ -26,7 +34,6 @@ pub fn fetch_asset_ids(
 
     let mut batches: Vec<Vec<String>> = vec![];
     let mut batch: Vec<String> = vec![];
-    let mut batch_counter = 1usize;
 
     let mut batch_idx = 0usize;
     let mut asset_batch_map = HashMap::new();
@@ -34,13 +41,10 @@ pub fn fetch_asset_ids(
     for token_id in token_ids {
         batch.push(token_id.clone());
         asset_batch_map.insert(token_id.clone(), batch_idx);
-        if batch_counter == BATCH_SIZE {
+        if batch.len() == BATCH_SIZE {
             batches.push(batch);
             batch = vec![];
-            batch_counter = 0;
             batch_idx += 1;
-        } else {
-            batch_counter += 1;
         }
 
         assets_ids.insert(token_id, Orderbook::new());
