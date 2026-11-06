@@ -23,13 +23,13 @@ pub fn extract_asset_id(market: &serde_json::Value) -> anyhow::Result<Option<Str
     Ok(ids[0].as_str().map(String::from))
 }
 
+pub type AssetIds = HashMap<String, Orderbook>;
+pub type Batches = Vec<Vec<String>>;
+pub type AssetBatchMap = HashMap<String, usize>;
+
 pub fn fetch_asset_ids(
     token_ids: Vec<String>,
-) -> anyhow::Result<(
-    HashMap<String, Orderbook>,
-    Vec<Vec<String>>,
-    HashMap<String, usize>,
-)> {
+) -> anyhow::Result<(AssetIds, Batches, AssetBatchMap)> {
     let mut assets_ids = std::collections::HashMap::new();
 
     let mut batches: Vec<Vec<String>> = vec![];

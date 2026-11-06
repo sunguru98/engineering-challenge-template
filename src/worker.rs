@@ -84,7 +84,7 @@ pub async fn run_worker(
                                 }
                             }).await;
 
-                            if let Err(_) = timeout_res {
+                            if timeout_res.is_err() {
                                 eprintln!("Websocket #{batch_idx} shutdown reply timed out")
                             }
 

@@ -52,7 +52,7 @@ async fn fetch_page(
     }
 
     eprintln!("{} tokens from {} events", token_ids.len(), events.len());
-    return Ok((token_ids, next_cursor));
+    Ok((token_ids, next_cursor))
 }
 
 async fn fetch_markets(
