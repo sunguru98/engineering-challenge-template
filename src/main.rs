@@ -6,6 +6,7 @@ use engineering_challenge::util::AlignedSbeWriter;
 use tokio::{
     signal,
     sync::{mpsc, watch},
+    task::JoinSet,
     time::interval,
 };
 
@@ -30,14 +31,12 @@ use crate::constants::{SNAPSHOT_TIME_SECONDS, UPDATE_EVENT_CHANNEL_SIZE, WORKER_
 #[tokio::main]
 async fn main() -> Result<()> {
     let token_ids = fetch_all_markets().await?;
-    eprintln!("Fetched {} tokens/asset_ids from events", token_ids.len());
-
     let file = std::path::Path::new("/dev/stdout");
     let mut writer = AlignedSbeWriter::create(file, CHUNK_SIZE_64_MEBIBYTES)?;
 
-    let (mut assets_ids, batches, mut asset_worker_map) = fetch_asset_ids(token_ids)?;
-    eprintln!("Total assets: {}", assets_ids.len());
+    let (mut assets_ids, batches, mut asset_batch_map) = fetch_asset_ids(token_ids)?;
     let batches_len = batches.len();
+    eprintln!("Total assets: {}", assets_ids.len());
     eprintln!("Total batches: {batches_len}");
 
     let mut batch_sender_map = HashMap::new();
@@ -45,7 +44,7 @@ async fn main() -> Result<()> {
     let (sender, mut receiver) = mpsc::channel(WORKER_CHANNEL_SIZE);
     let (signal_sender, signal_receiver) = watch::channel(false);
 
-    let mut join_set = tokio::task::JoinSet::new();
+    let mut join_set = JoinSet::new();
     for (batch_idx, batch) in batches.into_iter().enumerate() {
         let (event_sender, event_receiver) = mpsc::channel(UPDATE_EVENT_CHANNEL_SIZE);
         batch_sender_map.insert(batch_idx, event_sender);
@@ -53,15 +52,12 @@ async fn main() -> Result<()> {
         let signal_receiver = signal_receiver.clone();
         let sender = sender.clone();
 
-        join_set.spawn(run_worker(
-            batch_idx,
-            batch,
-            sender,
-            event_receiver,
-            signal_receiver,
-        ));
+        join_set.spawn(async move {
+            run_worker(batch_idx, batch, sender, event_receiver, signal_receiver)
+                .await
+                .map_err(|e| (batch_idx, e))
+        });
     }
-    drop(sender);
 
     let mut interval = interval(Duration::from_secs(SNAPSHOT_TIME_SECONDS));
     interval.tick().await;
@@ -73,6 +69,8 @@ async fn main() -> Result<()> {
 
     let sigint = signal::ctrl_c();
     tokio::pin!(sigint);
+
+    let mut main_sender = Some(sender);
     loop {
         if shutting_down && all_events_processed && work_complete {
             break;
@@ -83,6 +81,7 @@ async fn main() -> Result<()> {
                 eprintln!("\nCommencing Shutdown");
                 signal_sender.send(true)?;
                 shutting_down = true;
+                main_sender = None;
             }
 
             _ = interval.tick() => {
@@ -90,14 +89,38 @@ async fn main() -> Result<()> {
                 take_snapshot(&assets_ids, &mut writer)?;
             }
 
-            join_result = join_set.join_next(), if shutting_down && !work_complete => {
+            join_result = join_set.join_next(), if !work_complete && (shutting_down || !join_set.is_empty()) => {
                 match join_result {
                     Some(Ok(Ok(batch_idx))) => eprintln!("Websocket #{batch_idx} finished running"),
-                    Some(Ok(Err(err))) => eprintln!("Websocket finished with error: {err:?}"),
+                    Some(Ok(Err((batch_idx, err)))) => {
+                        eprintln!("Websocket #{batch_idx} finished with error: {err:?}");
+                        if !shutting_down {
+                            eprintln!("Retrying Websocket #{batch_idx}");
+                            let batch: Vec<String> = asset_batch_map
+                                .iter()
+                                .filter(|&(_, &idx)| idx == batch_idx)
+                                .map(|(asset, _)| asset.clone())
+                                .collect();
+
+                            let (event_sender, event_receiver) = mpsc::channel(UPDATE_EVENT_CHANNEL_SIZE);
+                            batch_sender_map.insert(batch_idx, event_sender);
+
+                            if let Some(main_sender) = main_sender.clone() {
+                                let signal_receiver = signal_receiver.clone();
+                                join_set.spawn(async move {
+                                    run_worker(batch_idx, batch, main_sender, event_receiver, signal_receiver)
+                                        .await
+                                        .map_err(|e| (batch_idx, e))
+                                });
+                            }
+                        }
+                    },
                     Some(Err(err)) => eprintln!("Task returned with error: {err:?}"),
                     None => {
-                        eprintln!("All websockets closed");
-                        work_complete = true
+                        if shutting_down {
+                            eprintln!("All websockets closed");
+                            work_complete = true
+                        }
                     }
                 }
             }
@@ -113,7 +136,7 @@ async fn main() -> Result<()> {
                             EType::MarketResolved => {
                                 if let Err(err) = handlers::handle_market_resolved(
                                     &mut assets_ids,
-                                    &mut asset_worker_map,
+                                    &mut asset_batch_map,
                                     &batch_sender_map,
                                     &e_data,
                                 )
@@ -125,7 +148,7 @@ async fn main() -> Result<()> {
                             EType::NewMarket => {
                                 if let Err(err) = handlers::handle_new_market(
                                     &mut assets_ids,
-                                    &mut asset_worker_map,
+                                    &mut asset_batch_map,
                                     &batch_sender_map,
                                     &mut next_batch_idx,
                                     batches_len,

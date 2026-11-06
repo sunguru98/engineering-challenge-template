@@ -12,7 +12,8 @@ use tokio::{
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 
 use crate::{
-    constants::{HEARTBEAT_TIMER_SECONDS, MAX_ATTEMPTS, STABLE_CHECK_SECONDS, WS_URL}, types::{EType, Event, SubscriptionPayload, UpdateEvents},
+    constants::{HEARTBEAT_TIMER_SECONDS, MAX_ATTEMPTS, STABLE_CHECK_SECONDS, WS_URL},
+    types::{EType, Event, SubscriptionPayload, UpdateEvents},
 };
 
 pub async fn run_worker(
@@ -28,9 +29,9 @@ pub async fn run_worker(
     let mut delay_seconds = std::time::Duration::from_secs(1);
     let maximum_delay_seconds = std::time::Duration::from_secs(30);
 
-    let mut worker_payload: HashSet<String> = HashSet::new();
+    let mut worker_asset_ids: HashSet<String> = HashSet::new();
     for key in batch.into_iter() {
-        worker_payload.insert(key);
+        worker_asset_ids.insert(key);
     }
 
     let mut heartbeat_interval = interval(Duration::from_secs(HEARTBEAT_TIMER_SECONDS));
@@ -48,7 +49,7 @@ pub async fn run_worker(
             let (mut write, mut read) = stream.split();
 
             let payload = serde_json::to_string(&SubscriptionPayload {
-                assets_ids: worker_payload.iter().map(String::from).collect(),
+                assets_ids: worker_asset_ids.iter().map(String::from).collect(),
                 r#type: "market",
                 custom_feature_enabled: true,
                 initial_dump: true,
@@ -60,8 +61,7 @@ pub async fn run_worker(
                 ))
                 .await?;
 
-            eprintln!("Subscription done for websocket batch #{batch_idx} :)");
-            
+            eprintln!("Subscription done for websocket batch #{batch_idx}");
             loop {
                 tokio::select! {
                     _ = signal_receiver.changed() => {
@@ -107,7 +107,7 @@ pub async fn run_worker(
                                         write.send(payload.to_string().into()).await?;
                                         eprintln!("Unsubscribed market of {asset_ids:?} succesfully");
                                         for id in asset_ids {
-                                            worker_payload.remove(&id);
+                                            worker_asset_ids.remove(&id);
                                         }
                                     },
                                     UpdateEvents::NewMarket { asset_ids } => {
@@ -118,7 +118,7 @@ pub async fn run_worker(
                                         write.send(payload.to_string().into()).await?;
                                         eprintln!("New market of {asset_ids:?} added succesfully");
                                         for id in asset_ids {
-                                            worker_payload.insert(id);
+                                            worker_asset_ids.insert(id);
                                         }
                                     }
                                 }

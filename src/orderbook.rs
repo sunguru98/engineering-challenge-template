@@ -5,6 +5,22 @@ use engineering_challenge::util::{
     AlignedSbeWriter,
     dtos::challenge_orderbook::{SnapshotAsksEntryDomain, SnapshotBidsEntryDomain, SnapshotDomain},
 };
+// use tokio::sync::mpsc::Sender;
+
+// use crate::types::UpdateEvents;
+
+// pub struct CentralProcessor {
+//     pub assets_ids: HashMap<String, Orderbook>,
+//     pub batches: Vec<Vec<String>>,
+//     pub asset_id_batch_idx: HashMap<String, usize>,
+//     pub batch_idx_sender_channel: HashMap<usize, Sender<UpdateEvents>>
+// }
+
+// impl CentralProcessor {
+//     pub fn new() -> Self {
+
+//     }
+// }
 
 #[derive(Debug)]
 pub struct Orderbook {
