@@ -13,28 +13,27 @@ use tokio_tungstenite::{connect_async, tungstenite::Message};
 
 use crate::{
     constants::{HEARTBEAT_TIMER_SECONDS, MAX_ATTEMPTS, STABLE_CHECK_SECONDS, WS_URL},
-    types::{EType, Event, SubscriptionPayload, UpdateEvents},
+    types::{Command, EType, Event, SubscriptionPayload},
 };
 
 pub async fn run_worker(
+    socket_id: usize,
     batch_idx: usize,
     batch: Vec<String>,
     sender: mpsc::Sender<Event>,
-    mut event_receiver: mpsc::Receiver<UpdateEvents>,
+    mut event_receiver: mpsc::Receiver<Command>,
     mut signal_receiver: watch::Receiver<bool>,
 ) -> anyhow::Result<usize> {
     let mut event_sender_closed = false;
-
     let mut attempt_number = 1;
     let mut delay_seconds = std::time::Duration::from_secs(1);
     let maximum_delay_seconds = std::time::Duration::from_secs(30);
-
     let mut worker_asset_ids: HashSet<String> = HashSet::new();
+    let mut heartbeat_interval = interval(Duration::from_secs(HEARTBEAT_TIMER_SECONDS));
+
     for key in batch.into_iter() {
         worker_asset_ids.insert(key);
     }
-
-    let mut heartbeat_interval = interval(Duration::from_secs(HEARTBEAT_TIMER_SECONDS));
     heartbeat_interval.tick().await;
 
     loop {
@@ -99,7 +98,7 @@ pub async fn run_worker(
                         match update_event {
                             Some(update_event) => {
                                 match update_event {
-                                    UpdateEvents::MarketResolved { asset_ids } => {
+                                    Command::MarketResolved { asset_ids } => {
                                         let payload = serde_json::json!({
                                             "operation": "unsubscribe",
                                             "assets_ids": asset_ids,
@@ -110,7 +109,7 @@ pub async fn run_worker(
                                             worker_asset_ids.remove(&id);
                                         }
                                     },
-                                    UpdateEvents::NewMarket { asset_ids } => {
+                                    Command::NewMarket { asset_ids } => {
                                         let payload = serde_json::json!({
                                             "operation": "subscribe",
                                             "assets_ids": asset_ids,
@@ -159,6 +158,7 @@ pub async fn run_worker(
                                         };
 
                                         let block_event = Event {
+                                            socket_id,
                                             data: event,
                                             e_type: event_type,
                                             received_at,

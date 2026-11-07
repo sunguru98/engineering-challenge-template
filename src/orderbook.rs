@@ -7,13 +7,13 @@ use engineering_challenge::util::{
 };
 // use tokio::sync::mpsc::Sender;
 
-// use crate::types::UpdateEvents;
+// use crate::types::Command;
 
 // pub struct CentralProcessor {
 //     pub assets_ids: HashMap<String, Orderbook>,
 //     pub batches: Vec<Vec<String>>,
 //     pub asset_id_batch_idx: HashMap<String, usize>,
-//     pub batch_idx_sender_channel: HashMap<usize, Sender<UpdateEvents>>
+//     pub batch_idx_sender_channel: HashMap<usize, Sender<Command>>
 // }
 
 // impl CentralProcessor {

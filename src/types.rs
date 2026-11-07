@@ -1,4 +1,15 @@
+use std::collections::{HashMap, HashSet};
+
 use chrono::{DateTime, Utc};
+use tokio::sync::mpsc::Sender;
+
+use crate::orderbook::Orderbook;
+
+pub type AssetIds = HashMap<String, Orderbook>;
+pub type Batches = Vec<Vec<String>>;
+pub type AssetBatchMap = HashMap<String, usize>;
+pub type SocketEventSenderMap = HashMap<usize, Sender<Command>>;
+pub type BatchSocketIdsMap = HashMap<usize, HashSet<usize>>;
 
 #[derive(serde::Serialize)]
 pub struct SubscriptionPayload {
@@ -52,13 +63,14 @@ pub enum EType {
 
 #[derive(Debug)]
 pub struct Event {
+    pub socket_id: usize,
     pub e_type: EType,
     pub data: serde_json::Value,
     pub received_at: DateTime<Utc>,
 }
 
 #[derive(Debug)]
-pub enum UpdateEvents {
+pub enum Command {
     MarketResolved { asset_ids: Vec<String> },
     NewMarket { asset_ids: Vec<String> },
 }

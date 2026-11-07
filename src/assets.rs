@@ -1,6 +1,10 @@
 use std::collections::HashMap;
 
-use crate::{constants::BATCH_SIZE, orderbook::Orderbook};
+use crate::{
+    constants::BATCH_SIZE,
+    orderbook::Orderbook,
+    types::{AssetBatchMap, AssetIds, Batches},
+};
 
 pub fn extract_asset_id(market: &serde_json::Value) -> anyhow::Result<Option<String>> {
     if market["active"].as_bool() != Some(true) {
@@ -22,10 +26,6 @@ pub fn extract_asset_id(market: &serde_json::Value) -> anyhow::Result<Option<Str
     }
     Ok(ids[0].as_str().map(String::from))
 }
-
-pub type AssetIds = HashMap<String, Orderbook>;
-pub type Batches = Vec<Vec<String>>;
-pub type AssetBatchMap = HashMap<String, usize>;
 
 pub fn fetch_asset_ids(
     token_ids: Vec<String>,

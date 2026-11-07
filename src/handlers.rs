@@ -6,17 +6,20 @@ use engineering_challenge::Side;
 use engineering_challenge::util::AlignedSbeWriter;
 use engineering_challenge::util::dtos::challenge_orderbook::PriceLevelUpdateDomain;
 use serde::Deserialize;
-use tokio::sync::mpsc;
 
 use crate::assets::extract_asset_id;
 use crate::orderbook::Orderbook;
 use crate::parse::convert_to_schema_int;
-use crate::types::{BookEvent, MarketResolvedEvent, PriceChangeEvent, UpdateEvents};
+use crate::types::{
+    AssetBatchMap, AssetIds, BatchSocketIdsMap, BookEvent, Command, MarketResolvedEvent,
+    PriceChangeEvent, SocketEventSenderMap,
+};
 
-pub async fn handle_market_resolved(
-    assets_ids: &mut HashMap<String, Orderbook>,
-    asset_worker_map: &mut HashMap<String, usize>,
-    batch_sender_map: &HashMap<usize, mpsc::Sender<UpdateEvents>>,
+pub fn handle_market_resolved(
+    assets_ids: &mut AssetIds,
+    asset_batch_map: &mut AssetBatchMap,
+    socket_event_sender_map: &SocketEventSenderMap,
+    batch_socket_ids_map: &BatchSocketIdsMap,
     e_data: &serde_json::Value,
 ) -> anyhow::Result<()> {
     let event = MarketResolvedEvent::deserialize(e_data)?;
@@ -25,29 +28,40 @@ pub async fn handle_market_resolved(
         if !assets_ids.contains_key(&id) {
             continue;
         }
-        let Some(&batch_idx) = asset_worker_map.get(&id) else {
-            continue;
-        };
-        let Some(sender) = batch_sender_map.get(&batch_idx) else {
+        let Some(&batch_idx) = asset_batch_map.get(&id) else {
             continue;
         };
 
-        sender
-            .send(UpdateEvents::MarketResolved {
-                asset_ids: vec![id.clone()],
-            })
-            .await?;
         assets_ids.remove(&id);
-        asset_worker_map.remove(&id);
+        asset_batch_map.remove(&id);
+
+        let Some(socket_ids) = batch_socket_ids_map.get(&batch_idx) else {
+            continue;
+        };
+
+        for socket_id in socket_ids {
+            let Some(event_sender) = socket_event_sender_map.get(socket_id) else {
+                eprintln!("[market_resolved] Socket #{socket_id} not found");
+                continue;
+            };
+
+            if let Err(err) = event_sender.try_send(Command::MarketResolved {
+                asset_ids: vec![id.clone()],
+            }) {
+                eprintln!("Error sending market_resolved event: {err:?}");
+                continue;
+            };
+        }
     }
 
     Ok(())
 }
 
-pub async fn handle_new_market(
-    assets_ids: &mut HashMap<String, Orderbook>,
-    asset_worker_map: &mut HashMap<String, usize>,
-    batch_sender_map: &HashMap<usize, mpsc::Sender<UpdateEvents>>,
+pub fn handle_new_market(
+    assets_ids: &mut AssetIds,
+    asset_batch_map: &mut AssetBatchMap,
+    socket_event_sender_map: &SocketEventSenderMap,
+    batch_socket_ids_map: &BatchSocketIdsMap,
     next_batch_idx: &mut usize,
     batches_len: usize,
     e_data: &serde_json::Value,
@@ -61,19 +75,28 @@ pub async fn handle_new_market(
     }
 
     let batch_idx = *next_batch_idx;
-    let Some(sender) = batch_sender_map.get(&batch_idx) else {
+    assets_ids.insert(asset_id.clone(), Orderbook::new());
+    asset_batch_map.insert(asset_id.clone(), batch_idx);
+    *next_batch_idx = (batch_idx + 1) % batches_len;
+
+    let Some(socket_ids) = batch_socket_ids_map.get(&batch_idx) else {
+        eprintln!("No websockets found for new_market");
         return Ok(());
     };
 
-    sender
-        .send(UpdateEvents::NewMarket {
-            asset_ids: vec![asset_id.clone()],
-        })
-        .await?;
+    for socket_id in socket_ids {
+        let Some(event_sender) = socket_event_sender_map.get(socket_id) else {
+            eprintln!("[new_market] Socket #{socket_id} not found");
+            continue;
+        };
 
-    assets_ids.insert(asset_id.clone(), Orderbook::new());
-    asset_worker_map.insert(asset_id, batch_idx);
-    *next_batch_idx = (batch_idx + 1) % batches_len;
+        if let Err(err) = event_sender.try_send(Command::NewMarket {
+            asset_ids: vec![asset_id.clone()],
+        }) {
+            eprintln!("Error sending new_market event: {err:?}");
+            continue;
+        };
+    }
 
     Ok(())
 }
