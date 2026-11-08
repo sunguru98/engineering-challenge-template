@@ -12,6 +12,7 @@ use crate::types::AssetIds;
 pub struct Books {
     pub socket_orderbook: HashMap<usize, Orderbook>,
     pub primary_socket_id: Option<usize>,
+    pub stalled_since: Option<DateTime<Utc>>,
 }
 
 impl Books {
@@ -19,13 +20,14 @@ impl Books {
         Self {
             socket_orderbook: HashMap::new(),
             primary_socket_id: None,
+            stalled_since: None,
         }
     }
 }
 
 #[derive(Debug)]
 pub struct Orderbook {
-    pub timestamp: DateTime<chrono::Utc>,
+    pub timestamp: DateTime<Utc>,
     pub bids: BTreeMap<i64, i64>,
     pub asks: BTreeMap<i64, i64>,
 }

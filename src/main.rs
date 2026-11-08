@@ -10,7 +10,7 @@ use tokio::{
     signal,
     sync::{mpsc, watch},
     task::JoinSet,
-    time::interval,
+    time::{interval, sleep},
 };
 
 mod assets;
@@ -29,7 +29,13 @@ use tokens::fetch_all_markets;
 use types::EType;
 use worker::run_worker;
 
-use crate::constants::{SNAPSHOT_TIME_SECONDS, UPDATE_EVENT_CHANNEL_SIZE, WORKER_CHANNEL_SIZE};
+use crate::{
+    constants::{
+        SNAPSHOT_TIME_SECONDS, SOCKETS_PER_BATCH, UPDATE_EVENT_CHANNEL_SIZE, WORKER_CHANNEL_SIZE,
+        WORKER_SLEEP_MS,
+    },
+    orderbook::write_snapshot,
+};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -60,30 +66,35 @@ async fn main() -> Result<()> {
     eprintln!("Total assets: {}", assets_ids.len());
     eprintln!("Total batches: {batches_len}");
     for (batch_idx, batch) in batches.into_iter().enumerate() {
-        let (event_sender, event_receiver) = mpsc::channel(UPDATE_EVENT_CHANNEL_SIZE);
         let mut socket_ids = HashSet::new();
-        socket_ids.insert(socket_id);
+
+        for _ in 0..SOCKETS_PER_BATCH {
+            let (event_sender, event_receiver) = mpsc::channel(UPDATE_EVENT_CHANNEL_SIZE);
+            let batch = batch.clone();
+            let signal_receiver = signal_receiver.clone();
+            let sender = sender.clone();
+
+            socket_event_sender_map.insert(socket_id, event_sender);
+            socket_ids.insert(socket_id);
+
+            join_set.spawn(async move {
+                sleep(Duration::from_millis(socket_id as u64 * WORKER_SLEEP_MS)).await;
+                run_worker(
+                    socket_id,
+                    batch_idx,
+                    batch,
+                    sender,
+                    event_receiver,
+                    signal_receiver,
+                )
+                .await
+                .map_err(|e| (socket_id, batch_idx, e))
+            });
+
+            socket_id += 1;
+        }
+
         batch_socket_ids_map.insert(batch_idx, socket_ids);
-
-        socket_event_sender_map.insert(socket_id, event_sender);
-
-        let signal_receiver = signal_receiver.clone();
-        let sender = sender.clone();
-
-        join_set.spawn(async move {
-            run_worker(
-                socket_id,
-                batch_idx,
-                batch,
-                sender,
-                event_receiver,
-                signal_receiver,
-            )
-            .await
-            .map_err(|e| (socket_id, batch_idx, e))
-        });
-
-        socket_id += 1;
     }
 
     let mut main_sender = Some(sender);
@@ -116,9 +127,9 @@ async fn main() -> Result<()> {
                             work_complete = true
                         }
                     }
-                    Some(Ok(Ok(batch_idx))) => eprintln!("Websocket #{batch_idx} finished running"),
+                    Some(Ok(Ok(batch_idx))) => eprintln!("Websocket #{socket_id} for #{batch_idx} finished running"),
                     Some(Ok(Err((err_socket_id, batch_idx, err)))) => {
-                        eprintln!("Websocket #{batch_idx} finished with error: {err:?}");
+                        eprintln!("Websocket #{err_socket_id} for #{batch_idx} finished with error: {err:?}");
                         if !shutting_down {
                             eprintln!("Retrying Websocket #{batch_idx}");
                             let batch: Vec<String> = asset_batch_map
@@ -142,8 +153,29 @@ async fn main() -> Result<()> {
                                             continue
                                         };
 
-                                        books.primary_socket_id = None;
+                                        books.stalled_since = None;
+
+                                        let is_primary_socket = books.primary_socket_id == Some(err_socket_id);
                                         books.socket_orderbook.remove(&err_socket_id);
+                                        if !is_primary_socket {
+                                            continue;
+                                        }
+
+                                        match books.socket_orderbook.keys().next() {
+                                            Some(other_socket_id) => {
+                                                books.primary_socket_id = Some(*other_socket_id);
+                                                let Some(other_orderbook) = books.socket_orderbook.get(other_socket_id) else {
+                                                    eprintln!("Unable to take snapshot of {other_socket_id}'s orderbook");
+                                                    continue;
+                                                };
+
+                                                write_snapshot(asset_id, other_orderbook, &mut writer)?;
+                                            },
+                                            None => {
+                                                books.primary_socket_id = None;
+                                            }
+                                        };
+
                                     }
 
                                     let signal_receiver = signal_receiver.clone();
@@ -208,7 +240,11 @@ async fn main() -> Result<()> {
                                     continue;
                                 }
 
-                                if let Err(err) = handlers::handle_book(event.socket_id, &mut assets_ids, &e_data) {
+                                if let Err(err) = handlers::handle_book(
+                                    event.socket_id,
+                                    &mut assets_ids,
+                                    &e_data,
+                                ) {
                                     eprintln!("Failed to handle book event: {err:#}");
                                 }
                             }

@@ -1,14 +1,15 @@
 use std::collections::BTreeMap;
 
 use anyhow::Context;
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, TimeDelta, Utc};
 use engineering_challenge::Side;
 use engineering_challenge::util::AlignedSbeWriter;
 use engineering_challenge::util::dtos::challenge_orderbook::PriceLevelUpdateDomain;
 use serde::Deserialize;
 
 use crate::assets::extract_asset_id;
-use crate::orderbook::{Books, Orderbook};
+use crate::constants::STALL_TIMER_SECONDS;
+use crate::orderbook::{Books, Orderbook, write_snapshot};
 use crate::parse::convert_to_schema_int;
 use crate::types::{
     AssetBatchMap, AssetIds, BatchSocketIdsMap, BookEvent, Command, MarketResolvedEvent,
@@ -150,7 +151,7 @@ pub fn handle_price_change(
     assets_ids: &mut AssetIds,
     writer: &mut AlignedSbeWriter,
     e_data: &serde_json::Value,
-    backtest_timestamp: DateTime<Utc>,
+    received_at: DateTime<Utc>,
 ) -> anyhow::Result<()> {
     let event = PriceChangeEvent::deserialize(e_data)?;
     let exchange_timestamp = DateTime::from_timestamp_millis(event.timestamp.parse()?)
@@ -198,14 +199,29 @@ pub fn handle_price_change(
         }
 
         if books.primary_socket_id == Some(socket_id) {
+            books.stalled_since = None;
             writer.write_msg(&PriceLevelUpdateDomain {
                 exchange_timestamp,
-                backtest_timestamp,
+                backtest_timestamp: received_at,
                 price_level,
                 quantity,
                 side,
                 symbol: pc.asset_id,
             })?;
+        } else {
+            match books.stalled_since {
+                None => books.stalled_since = Some(received_at),
+                Some(t) => {
+                    let time_elapsed = received_at - t;
+                    if time_elapsed >= TimeDelta::seconds(STALL_TIMER_SECONDS) {
+                        books.primary_socket_id = Some(socket_id);
+                        books.stalled_since = None;
+                        if let Some(orderbook) = books.socket_orderbook.get(&socket_id) {
+                            write_snapshot(&pc.asset_id, orderbook, writer)?;
+                        }
+                    }
+                }
+            }
         }
     }
 

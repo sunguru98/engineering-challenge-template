@@ -8,3 +8,6 @@ pub const BATCH_SIZE: usize = 2_500;
 pub const HEARTBEAT_TIMER_SECONDS: u64 = 10;
 pub const SNAPSHOT_TIME_SECONDS: u64 = 60;
 pub const STABLE_CHECK_SECONDS: u64 = 60;
+pub const SOCKETS_PER_BATCH: usize = 2;
+pub const WORKER_SLEEP_MS: u64 = 50;
+pub const STALL_TIMER_SECONDS: i64 = 10;

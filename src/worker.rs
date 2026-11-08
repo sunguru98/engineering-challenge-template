@@ -60,7 +60,7 @@ pub async fn run_worker(
                 ))
                 .await?;
 
-            eprintln!("Subscription done for websocket batch #{batch_idx}");
+            eprintln!("Subscription done for websocket #{socket_id} for batch #{batch_idx}");
             loop {
                 tokio::select! {
                     _ = signal_receiver.changed() => {
@@ -74,7 +74,7 @@ pub async fn run_worker(
                                 while let Some(response) = read.next().await {
                                     match response {
                                         Ok(Message::Close(_)) =>  {
-                                            eprintln!("Websocket #{batch_idx} closed succesfully");
+                                            eprintln!("Websocket #{socket_id} for #{batch_idx} closed succesfully");
                                             break;
                                         }
                                         Ok(_) => continue,
@@ -84,7 +84,7 @@ pub async fn run_worker(
                             }).await;
 
                             if timeout_res.is_err() {
-                                eprintln!("Websocket #{batch_idx} shutdown reply timed out")
+                                eprintln!("Websocket #{socket_id} for #{batch_idx} shutdown reply timed out")
                             }
 
                             break;
