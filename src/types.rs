@@ -3,9 +3,9 @@ use std::collections::{HashMap, HashSet};
 use chrono::{DateTime, Utc};
 use tokio::sync::mpsc::Sender;
 
-use crate::orderbook::Orderbook;
+use crate::orderbook::Books;
 
-pub type AssetIds = HashMap<String, Orderbook>;
+pub type AssetIds = HashMap<String, Books>;
 pub type Batches = Vec<Vec<String>>;
 pub type AssetBatchMap = HashMap<String, usize>;
 pub type SocketEventSenderMap = HashMap<usize, Sender<Command>>;

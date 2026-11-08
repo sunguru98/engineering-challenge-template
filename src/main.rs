@@ -127,6 +127,7 @@ async fn main() -> Result<()> {
                                 .map(|(asset, _)| asset.clone())
                                 .collect();
 
+
                             let (event_sender, event_receiver) = mpsc::channel(UPDATE_EVENT_CHANNEL_SIZE);
                             socket_event_sender_map.remove(&err_socket_id);
 
@@ -135,6 +136,15 @@ async fn main() -> Result<()> {
                                 if let Some(main_sender) = main_sender.clone() {
                                     socket_event_sender_map.insert(socket_id, event_sender);
                                     socket_ids.insert(socket_id);
+
+                                    for asset_id in batch.iter() {
+                                        let Some(books) = assets_ids.get_mut(asset_id) else {
+                                            continue
+                                        };
+
+                                        books.primary_socket_id = None;
+                                        books.socket_orderbook.remove(&err_socket_id);
+                                    }
 
                                     let signal_receiver = signal_receiver.clone();
                                     join_set.spawn(async move {
@@ -194,12 +204,21 @@ async fn main() -> Result<()> {
                                 }
                             }
                             EType::Book => {
-                                if let Err(err) = handlers::handle_book(&mut assets_ids, &e_data) {
+                                if !socket_event_sender_map.contains_key(&event.socket_id) {
+                                    continue;
+                                }
+
+                                if let Err(err) = handlers::handle_book(event.socket_id, &mut assets_ids, &e_data) {
                                     eprintln!("Failed to handle book event: {err:#}");
                                 }
                             }
                             EType::PriceChange => {
+                                if !socket_event_sender_map.contains_key(&event.socket_id) {
+                                    continue;
+                                }
+
                                 if let Err(err) = handlers::handle_price_change(
+                                    event.socket_id,
                                     &mut assets_ids,
                                     &mut writer,
                                     &e_data,

@@ -102,6 +102,7 @@ pub async fn run_worker(
                                         let payload = serde_json::json!({
                                             "operation": "unsubscribe",
                                             "assets_ids": asset_ids,
+                                            "custom_feature_enabled": true,
                                         });
                                         write.send(payload.to_string().into()).await?;
                                         eprintln!("Unsubscribed market of {asset_ids:?} succesfully");
@@ -113,6 +114,7 @@ pub async fn run_worker(
                                         let payload = serde_json::json!({
                                             "operation": "subscribe",
                                             "assets_ids": asset_ids,
+                                            "custom_feature_enabled": true,
                                         });
                                         write.send(payload.to_string().into()).await?;
                                         eprintln!("New market of {asset_ids:?} added succesfully");

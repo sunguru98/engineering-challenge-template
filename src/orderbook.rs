@@ -5,22 +5,23 @@ use engineering_challenge::util::{
     AlignedSbeWriter,
     dtos::challenge_orderbook::{SnapshotAsksEntryDomain, SnapshotBidsEntryDomain, SnapshotDomain},
 };
-// use tokio::sync::mpsc::Sender;
 
-// use crate::types::Command;
+use crate::types::AssetIds;
 
-// pub struct CentralProcessor {
-//     pub assets_ids: HashMap<String, Orderbook>,
-//     pub batches: Vec<Vec<String>>,
-//     pub asset_id_batch_idx: HashMap<String, usize>,
-//     pub batch_idx_sender_channel: HashMap<usize, Sender<Command>>
-// }
+#[derive(Debug)]
+pub struct Books {
+    pub socket_orderbook: HashMap<usize, Orderbook>,
+    pub primary_socket_id: Option<usize>,
+}
 
-// impl CentralProcessor {
-//     pub fn new() -> Self {
-
-//     }
-// }
+impl Books {
+    pub fn new() -> Self {
+        Self {
+            socket_orderbook: HashMap::new(),
+            primary_socket_id: None,
+        }
+    }
+}
 
 #[derive(Debug)]
 pub struct Orderbook {
@@ -71,11 +72,17 @@ pub fn write_snapshot(
     Ok(())
 }
 
-pub fn take_snapshot(
-    assets_ids: &HashMap<String, Orderbook>,
-    writer: &mut AlignedSbeWriter,
-) -> anyhow::Result<()> {
-    for (asset_id, orderbook) in assets_ids.iter() {
+pub fn take_snapshot(assets_ids: &AssetIds, writer: &mut AlignedSbeWriter) -> anyhow::Result<()> {
+    for (asset_id, books) in assets_ids.iter() {
+        let Some(primary_socket_id) = books.primary_socket_id else {
+            eprintln!("Skipping {asset_id} since no socket present");
+            continue;
+        };
+
+        let Some(orderbook) = books.socket_orderbook.get(&primary_socket_id) else {
+            continue;
+        };
+
         write_snapshot(asset_id, orderbook, writer)?;
     }
     Ok(())

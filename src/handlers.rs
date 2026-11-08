@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 
 use anyhow::Context;
 use chrono::{DateTime, Utc};
@@ -8,7 +8,7 @@ use engineering_challenge::util::dtos::challenge_orderbook::PriceLevelUpdateDoma
 use serde::Deserialize;
 
 use crate::assets::extract_asset_id;
-use crate::orderbook::Orderbook;
+use crate::orderbook::{Books, Orderbook};
 use crate::parse::convert_to_schema_int;
 use crate::types::{
     AssetBatchMap, AssetIds, BatchSocketIdsMap, BookEvent, Command, MarketResolvedEvent,
@@ -75,7 +75,7 @@ pub fn handle_new_market(
     }
 
     let batch_idx = *next_batch_idx;
-    assets_ids.insert(asset_id.clone(), Orderbook::new());
+    assets_ids.insert(asset_id.clone(), Books::new());
     asset_batch_map.insert(asset_id.clone(), batch_idx);
     *next_batch_idx = (batch_idx + 1) % batches_len;
 
@@ -102,13 +102,11 @@ pub fn handle_new_market(
 }
 
 pub fn handle_book(
-    assets_ids: &mut HashMap<String, Orderbook>,
+    socket_id: usize,
+    assets_ids: &mut AssetIds,
     e_data: &serde_json::Value,
 ) -> anyhow::Result<()> {
     let book_event = BookEvent::deserialize(e_data)?;
-    let Some(orderbook) = assets_ids.get_mut(&book_event.asset_id) else {
-        return Ok(());
-    };
 
     let timestamp = chrono::DateTime::from_timestamp_millis(book_event.timestamp.parse()?)
         .context("Failed to parse timestamp")?;
@@ -129,27 +127,42 @@ pub fn handle_book(
         );
     }
 
+    let Some(books) = assets_ids.get_mut(&book_event.asset_id) else {
+        return Ok(());
+    };
+
+    if books.primary_socket_id.is_none() {
+        books.primary_socket_id = Some(socket_id);
+    }
+
+    let mut orderbook = Orderbook::new();
     orderbook.timestamp = timestamp;
     orderbook.asks = asks;
     orderbook.bids = bids;
+
+    books.socket_orderbook.insert(socket_id, orderbook);
 
     Ok(())
 }
 
 pub fn handle_price_change(
-    assets_ids: &mut HashMap<String, Orderbook>,
+    socket_id: usize,
+    assets_ids: &mut AssetIds,
     writer: &mut AlignedSbeWriter,
     e_data: &serde_json::Value,
     backtest_timestamp: DateTime<Utc>,
 ) -> anyhow::Result<()> {
     let event = PriceChangeEvent::deserialize(e_data)?;
-    let exchange_timestamp = chrono::DateTime::from_timestamp_millis(event.timestamp.parse()?)
+    let exchange_timestamp = DateTime::from_timestamp_millis(event.timestamp.parse()?)
         .context("Failed to parse timestamp")?;
 
     for pc in event.price_changes {
-        let Some(orderbook) = assets_ids.get_mut(&pc.asset_id) else {
-            continue;
+        let side = match pc.side.as_str() {
+            "SELL" => Side::Sell,
+            "BUY" => Side::Buy,
+            _ => continue,
         };
+
         let Ok(price_level) = convert_to_schema_int(&pc.price) else {
             eprintln!("Invalid price: {}", pc.price);
             continue;
@@ -158,11 +171,19 @@ pub fn handle_price_change(
             eprintln!("Invalid size: {}", pc.size);
             continue;
         };
-        let side = match pc.side.as_str() {
-            "SELL" => Side::Sell,
-            "BUY" => Side::Buy,
-            _ => continue,
+
+        let Some(books) = assets_ids.get_mut(&pc.asset_id) else {
+            continue;
         };
+
+        if books.primary_socket_id.is_none() {
+            books.primary_socket_id = Some(socket_id);
+        }
+
+        let orderbook = books
+            .socket_orderbook
+            .entry(socket_id)
+            .or_insert_with(|| Orderbook::new());
 
         orderbook.timestamp = exchange_timestamp;
 
@@ -176,14 +197,16 @@ pub fn handle_price_change(
             book_side.insert(price_level, quantity);
         }
 
-        writer.write_msg(&PriceLevelUpdateDomain {
-            exchange_timestamp,
-            backtest_timestamp,
-            price_level,
-            quantity,
-            side,
-            symbol: pc.asset_id,
-        })?;
+        if books.primary_socket_id == Some(socket_id) {
+            writer.write_msg(&PriceLevelUpdateDomain {
+                exchange_timestamp,
+                backtest_timestamp,
+                price_level,
+                quantity,
+                side,
+                symbol: pc.asset_id,
+            })?;
+        }
     }
 
     Ok(())

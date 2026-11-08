@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use crate::{
     constants::BATCH_SIZE,
-    orderbook::Orderbook,
+    orderbook::Books,
     types::{AssetBatchMap, AssetIds, Batches},
 };
 
@@ -47,7 +47,7 @@ pub fn fetch_asset_ids(
             batch_idx += 1;
         }
 
-        assets_ids.insert(token_id, Orderbook::new());
+        assets_ids.insert(token_id, Books::new());
     }
 
     if !batch.is_empty() {
