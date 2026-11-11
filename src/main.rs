@@ -19,16 +19,13 @@ mod exchanges;
 mod handlers;
 mod orderbook;
 mod parse;
-mod tokens;
 mod types;
 mod worker;
 
 use assets::fetch_symbols;
 use constants::CHUNK_SIZE_64_MEBIBYTES;
-use exchanges::*;
 use messages::MarketEvent;
 use orderbook::take_snapshot;
-use tokens::fetch_all_markets;
 use worker::run_worker;
 
 use crate::{
@@ -36,8 +33,10 @@ use crate::{
         SNAPSHOT_TIME_SECONDS, SOCKETS_PER_BATCH, UPDATE_EVENT_CHANNEL_SIZE, WORKER_CHANNEL_SIZE,
         WORKER_SLEEP_MS,
     },
+    exchanges::*,
     handlers::{add_symbol, apply_level_update, apply_snapshot, remove_symbol},
     orderbook::write_snapshot,
+    polymarket::discovery::*,
 };
 
 #[tokio::main]
@@ -219,12 +218,12 @@ async fn main() -> Result<()> {
                                     bids,
                                     exchange_time,
                                 } => {
-                                    if !socket_event_sender_map.contains_key(&socket_id) {
+                                    if !socket_event_sender_map.contains_key(&incoming_message.socket_id) {
                                         continue;
                                     }
 
                                     apply_snapshot(
-                                        socket_id,
+                                        incoming_message.socket_id,
                                         &mut symbol_books_map,
                                         symbol,
                                         exchange_time,
@@ -240,7 +239,7 @@ async fn main() -> Result<()> {
                                     side,
                                     symbol,
                                 } => {
-                                    if !socket_event_sender_map.contains_key(&socket_id) {
+                                    if !socket_event_sender_map.contains_key(&incoming_message.socket_id) {
                                         continue;
                                     }
 

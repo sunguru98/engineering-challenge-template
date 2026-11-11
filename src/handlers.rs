@@ -83,7 +83,7 @@ pub fn apply_level_update(
         book_side.insert(price, quantity);
     }
 
-    if books.primary_socket_id != Some(socket_id) {
+    if books.primary_socket_id == Some(socket_id) {
         books.stalled_since = None;
         writer.write_msg(&PriceLevelUpdateDomain {
             exchange_timestamp: timestamp,
@@ -174,14 +174,14 @@ pub fn remove_symbol(
     for socket_id in socket_ids {
         let Some(event_sender) = socket_event_sender_map.get(socket_id) else {
             eprintln!("[market_resolved] Socket #{socket_id} not found");
-            return;
+            continue;
         };
 
         if let Err(err) = event_sender.try_send(Command::Unsubscribe {
             symbols: vec![symbol.clone()],
         }) {
             eprintln!("Error sending market_resolved event: {err:?}");
-            return;
+            continue;
         };
     }
 }

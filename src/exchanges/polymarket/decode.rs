@@ -8,36 +8,36 @@ use crate::parse::convert_to_schema_int;
 use engineering_challenge::Side;
 
 #[derive(Deserialize, Debug)]
-pub struct PriceData {
-    pub price: String,
-    pub size: String,
+struct PriceData {
+    price: String,
+    size: String,
 }
 
 #[derive(Deserialize, Debug)]
-pub struct BookEvent {
-    pub asset_id: String,
-    pub timestamp: String,
-    pub bids: Vec<PriceData>,
-    pub asks: Vec<PriceData>,
+struct BookEvent {
+    asset_id: String,
+    timestamp: String,
+    bids: Vec<PriceData>,
+    asks: Vec<PriceData>,
 }
 
 #[derive(Deserialize, Debug)]
-pub struct PriceChangeEvent {
-    pub timestamp: String,
-    pub price_changes: Vec<PriceChange>,
+struct PriceChangeEvent {
+    timestamp: String,
+    price_changes: Vec<PriceChange>,
 }
 
 #[derive(Deserialize, Debug)]
-pub struct MarketResolvedEvent {
-    pub assets_ids: Vec<String>,
+struct MarketResolvedEvent {
+    assets_ids: Vec<String>,
 }
 
 #[derive(Deserialize, Debug)]
-pub struct PriceChange {
-    pub asset_id: String,
-    pub price: String,
-    pub side: String,
-    pub size: String,
+struct PriceChange {
+    asset_id: String,
+    price: String,
+    side: String,
+    size: String,
 }
 
 fn extract_asset_id(market: &Value) -> Option<String> {

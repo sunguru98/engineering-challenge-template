@@ -11,9 +11,9 @@ use tokio::{
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 
 use crate::{
-    constants::{HEARTBEAT_TIMER_SECONDS, MAX_ATTEMPTS, STABLE_CHECK_SECONDS},
+    constants::{MAX_ATTEMPTS, STABLE_CHECK_SECONDS},
     messages::Command,
-    polymarket::{WS_URL, decode},
+    polymarket::{HEARTBEAT_TIMER_SECONDS, WS_URL, decode},
     types::{IncomingMessage, SubscriptionPayload},
 };
 
