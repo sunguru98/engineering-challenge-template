@@ -130,9 +130,9 @@ async fn main() -> Result<()> {
                             work_complete = true
                         }
                     }
-                    Some(Ok(Ok(batch_idx))) => eprintln!("Websocket #{socket_id} for #{batch_idx} finished running"),
+                    Some(Ok(Ok((batch_idx, socket_id)))) => eprintln!("Websocket #{socket_id} for batch #{batch_idx} finished running"),
                     Some(Ok(Err((err_socket_id, batch_idx, err)))) => {
-                        eprintln!("Websocket #{err_socket_id} for #{batch_idx} finished with error: {err:?}");
+                        eprintln!("Websocket #{err_socket_id} for batch #{batch_idx} finished with error: {err:?}");
                         if !shutting_down {
                             eprintln!("Retrying Websocket #{batch_idx}");
                             let batch: Vec<String> = symbol_batch_map

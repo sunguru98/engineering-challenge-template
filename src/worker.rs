@@ -24,7 +24,7 @@ pub async fn run_worker(
     sender: mpsc::Sender<IncomingMessage>,
     mut event_receiver: mpsc::Receiver<Command>,
     mut signal_receiver: watch::Receiver<bool>,
-) -> anyhow::Result<usize> {
+) -> anyhow::Result<(usize, usize)> {
     let mut event_sender_closed = false;
     let mut attempt_number = 1;
     let mut delay_seconds = std::time::Duration::from_secs(1);
@@ -186,5 +186,5 @@ pub async fn run_worker(
         }
     }
 
-    Ok(batch_idx)
+    Ok((batch_idx, socket_id))
 }

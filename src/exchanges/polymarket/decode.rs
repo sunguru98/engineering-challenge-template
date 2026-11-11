@@ -184,7 +184,6 @@ pub fn decode(raw_message: &str) -> Vec<MarketEvent> {
             "new_market" => decode_new_market(&event),
             "market_resolved" => decode_market_resolved(&event),
             _ => {
-                eprintln!("Unknown event_type: {event_type}");
                 continue;
             }
         } {
