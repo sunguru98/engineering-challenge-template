@@ -6,7 +6,7 @@ use engineering_challenge::util::{
     dtos::challenge_orderbook::{SnapshotAsksEntryDomain, SnapshotBidsEntryDomain, SnapshotDomain},
 };
 
-use crate::types::AssetIds;
+use crate::types::SymbolBooksMap;
 
 #[derive(Debug)]
 pub struct Books {
@@ -74,7 +74,7 @@ pub fn write_snapshot(
     Ok(())
 }
 
-pub fn take_snapshot(assets_ids: &AssetIds, writer: &mut AlignedSbeWriter) -> anyhow::Result<()> {
+pub fn take_snapshot(assets_ids: &SymbolBooksMap, writer: &mut AlignedSbeWriter) -> anyhow::Result<()> {
     for (asset_id, books) in assets_ids.iter() {
         let Some(primary_socket_id) = books.primary_socket_id else {
             eprintln!("Skipping {asset_id} since no socket present");

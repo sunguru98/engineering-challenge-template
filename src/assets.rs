@@ -1,46 +1,25 @@
 use std::collections::HashMap;
 
 use crate::{
-    constants::BATCH_SIZE,
     orderbook::Books,
-    types::{AssetBatchMap, AssetIds, Batches},
+    polymarket::constants::BATCH_SIZE,
+    types::{Batches, SymbolBatchMap, SymbolBooksMap},
 };
 
-pub fn extract_asset_id(market: &serde_json::Value) -> anyhow::Result<Option<String>> {
-    if market["active"].as_bool() != Some(true) {
-        return Ok(None);
-    }
-
-    let ids = match market["clob_token_ids"].as_array() {
-        Some(ids) => ids,
-        None => {
-            let Some(asset_ids) = market["assets_ids"].as_array() else {
-                return Ok(None);
-            };
-            asset_ids
-        }
-    };
-
-    if ids.len() != 2 {
-        return Ok(None);
-    }
-    Ok(ids[0].as_str().map(String::from))
-}
-
-pub fn fetch_asset_ids(
+pub fn fetch_symbols(
     token_ids: Vec<String>,
-) -> anyhow::Result<(AssetIds, Batches, AssetBatchMap)> {
+) -> anyhow::Result<(SymbolBooksMap, Batches, SymbolBatchMap)> {
     let mut assets_ids = std::collections::HashMap::new();
 
     let mut batches: Vec<Vec<String>> = vec![];
     let mut batch: Vec<String> = vec![];
 
     let mut batch_idx = 0usize;
-    let mut asset_batch_map = HashMap::new();
+    let mut symbol_batch_map = HashMap::new();
 
     for token_id in token_ids {
         batch.push(token_id.clone());
-        asset_batch_map.insert(token_id.clone(), batch_idx);
+        symbol_batch_map.insert(token_id.clone(), batch_idx);
         if batch.len() == BATCH_SIZE {
             batches.push(batch);
             batch = vec![];
@@ -54,5 +33,5 @@ pub fn fetch_asset_ids(
         batches.push(batch)
     }
 
-    Ok((assets_ids, batches, asset_batch_map))
+    Ok((assets_ids, batches, symbol_batch_map))
 }

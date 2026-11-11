@@ -15,6 +15,7 @@ use tokio::{
 
 mod assets;
 mod constants;
+mod exchanges;
 mod handlers;
 mod orderbook;
 mod parse;
@@ -22,11 +23,12 @@ mod tokens;
 mod types;
 mod worker;
 
-use assets::fetch_asset_ids;
+use assets::fetch_symbols;
 use constants::CHUNK_SIZE_64_MEBIBYTES;
+use exchanges::*;
+use messages::MarketEvent;
 use orderbook::take_snapshot;
 use tokens::fetch_all_markets;
-use types::EType;
 use worker::run_worker;
 
 use crate::{
@@ -34,6 +36,7 @@ use crate::{
         SNAPSHOT_TIME_SECONDS, SOCKETS_PER_BATCH, UPDATE_EVENT_CHANNEL_SIZE, WORKER_CHANNEL_SIZE,
         WORKER_SLEEP_MS,
     },
+    handlers::{add_symbol, apply_level_update, apply_snapshot, remove_symbol},
     orderbook::write_snapshot,
 };
 
@@ -43,13 +46,11 @@ async fn main() -> Result<()> {
     let token_ids = fetch_all_markets().await?;
     let file = std::path::Path::new("/dev/stdout");
     let mut writer = AlignedSbeWriter::create(file, CHUNK_SIZE_64_MEBIBYTES)?;
-    let (mut assets_ids, batches, mut asset_batch_map) = fetch_asset_ids(token_ids)?;
+    let (mut symbol_books_map, batches, mut symbol_batch_map) = fetch_symbols(token_ids)?;
     let batches_len = batches.len();
-    // let mut batch_event_sender_map = HashMap::new();
     let (sender, mut receiver) = mpsc::channel(WORKER_CHANNEL_SIZE);
     let (signal_sender, signal_receiver) = watch::channel(false);
     let mut interval = interval(Duration::from_secs(SNAPSHOT_TIME_SECONDS));
-    interval.tick().await;
     let mut shutting_down = false;
     let mut all_events_processed = false;
     let mut work_complete = false;
@@ -63,7 +64,9 @@ async fn main() -> Result<()> {
     // -----------------------------------------------------------------------
 
     tokio::pin!(sigint);
-    eprintln!("Total assets: {}", assets_ids.len());
+    interval.tick().await;
+
+    eprintln!("Total assets: {}", symbol_books_map.len());
     eprintln!("Total batches: {batches_len}");
     for (batch_idx, batch) in batches.into_iter().enumerate() {
         let mut socket_ids = HashSet::new();
@@ -116,7 +119,7 @@ async fn main() -> Result<()> {
 
             _ = interval.tick() => {
                 eprintln!("Creating a snapshot at {}", Utc::now());
-                take_snapshot(&assets_ids, &mut writer)?;
+                take_snapshot(&symbol_books_map, &mut writer)?;
             }
 
             join_result = join_set.join_next(), if can_view_join_result => {
@@ -132,7 +135,7 @@ async fn main() -> Result<()> {
                         eprintln!("Websocket #{err_socket_id} for #{batch_idx} finished with error: {err:?}");
                         if !shutting_down {
                             eprintln!("Retrying Websocket #{batch_idx}");
-                            let batch: Vec<String> = asset_batch_map
+                            let batch: Vec<String> = symbol_batch_map
                                 .iter()
                                 .filter(|&(_, &idx)| idx == batch_idx)
                                 .map(|(asset, _)| asset.clone())
@@ -149,7 +152,7 @@ async fn main() -> Result<()> {
                                     socket_ids.insert(socket_id);
 
                                     for asset_id in batch.iter() {
-                                        let Some(books) = assets_ids.get_mut(asset_id) else {
+                                        let Some(books) = symbol_books_map.get_mut(asset_id) else {
                                             continue
                                         };
 
@@ -201,66 +204,79 @@ async fn main() -> Result<()> {
                 }
             }
 
-            event = receiver.recv(), if !all_events_processed => {
-                match event {
+            incoming_message = receiver.recv(), if !all_events_processed => {
+                match incoming_message {
                     None => {
                         all_events_processed = true;
                     }
-                    Some(event) => {
-                        let e_data = event.data;
-                        match event.e_type {
-                            EType::MarketResolved => {
-                                if let Err(err) = handlers::handle_market_resolved(
-                                    &mut assets_ids,
-                                    &mut asset_batch_map,
-                                    &socket_event_sender_map,
-                                    &batch_socket_ids_map,
-                                    &e_data,
-                                )
-                                {
-                                    eprintln!("Failed to handle market_resolved event: {err:#}");
-                                }
-                            }
-                            EType::NewMarket => {
-                                if let Err(err) = handlers::handle_new_market(
-                                    &mut assets_ids,
-                                    &mut asset_batch_map,
-                                    &socket_event_sender_map,
-                                    &batch_socket_ids_map,
-                                    &mut next_batch_idx,
-                                    batches_len,
-                                    &e_data,
-                                )
-                                {
-                                    eprintln!("Failed to handle new_market event: {err:#}");
-                                }
-                            }
-                            EType::Book => {
-                                if !socket_event_sender_map.contains_key(&event.socket_id) {
-                                    continue;
+
+                    Some(incoming_message) => {
+                        for event in incoming_message.market_events {
+                            match event {
+                                MarketEvent::Snapshot {
+                                    symbol,
+                                    asks,
+                                    bids,
+                                    exchange_time,
+                                } => {
+                                    if !socket_event_sender_map.contains_key(&socket_id) {
+                                        continue;
+                                    }
+
+                                    apply_snapshot(
+                                        socket_id,
+                                        &mut symbol_books_map,
+                                        symbol,
+                                        exchange_time,
+                                        bids,
+                                        asks,
+                                    )?;
                                 }
 
-                                if let Err(err) = handlers::handle_book(
-                                    event.socket_id,
-                                    &mut assets_ids,
-                                    &e_data,
-                                ) {
-                                    eprintln!("Failed to handle book event: {err:#}");
-                                }
-                            }
-                            EType::PriceChange => {
-                                if !socket_event_sender_map.contains_key(&event.socket_id) {
-                                    continue;
+                                MarketEvent::LevelUpdate {
+                                    exchange_time,
+                                    new_quantity,
+                                    price,
+                                    side,
+                                    symbol,
+                                } => {
+                                    if !socket_event_sender_map.contains_key(&socket_id) {
+                                        continue;
+                                    }
+
+                                    apply_level_update(
+                                        incoming_message.socket_id,
+                                        &mut symbol_books_map,
+                                        symbol,
+                                        &mut writer,
+                                        exchange_time,
+                                        side,
+                                        price,
+                                        new_quantity,
+                                        incoming_message.received_at,
+                                    )?;
                                 }
 
-                                if let Err(err) = handlers::handle_price_change(
-                                    event.socket_id,
-                                    &mut assets_ids,
-                                    &mut writer,
-                                    &e_data,
-                                    event.received_at,
-                                ) {
-                                    eprintln!("Failed to handle price_change event: {err:#}");
+                                MarketEvent::SymbolAdded { symbol } => {
+                                    add_symbol(
+                                        symbol,
+                                        &mut symbol_books_map,
+                                        &mut symbol_batch_map,
+                                        &socket_event_sender_map,
+                                        &batch_socket_ids_map,
+                                        &mut next_batch_idx,
+                                        batches_len,
+                                    );
+                                }
+
+                                MarketEvent::SymbolRemoved { symbol } => {
+                                    remove_symbol(
+                                        symbol,
+                                        &mut symbol_books_map,
+                                        &mut symbol_batch_map,
+                                        &socket_event_sender_map,
+                                        &batch_socket_ids_map,
+                                    );
                                 }
                             }
                         }

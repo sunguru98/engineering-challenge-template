@@ -1,6 +1,6 @@
 use rand::RngExt;
 
-use crate::constants::{HTTP_URL, MAX_ATTEMPTS};
+use crate::{constants::MAX_ATTEMPTS, polymarket::HTTP_URL};
 
 async fn fetch_page(
     client: &reqwest::Client,

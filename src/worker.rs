@@ -1,7 +1,6 @@
 use std::collections::HashSet;
 use std::time::Duration;
 
-use anyhow::Context;
 use chrono::Utc;
 use futures_util::{SinkExt, StreamExt};
 use rand::RngExt;
@@ -12,15 +11,17 @@ use tokio::{
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 
 use crate::{
-    constants::{HEARTBEAT_TIMER_SECONDS, MAX_ATTEMPTS, STABLE_CHECK_SECONDS, WS_URL},
-    types::{Command, EType, Event, SubscriptionPayload},
+    constants::{HEARTBEAT_TIMER_SECONDS, MAX_ATTEMPTS, STABLE_CHECK_SECONDS},
+    messages::Command,
+    polymarket::{WS_URL, decode},
+    types::{IncomingMessage, SubscriptionPayload},
 };
 
 pub async fn run_worker(
     socket_id: usize,
     batch_idx: usize,
     batch: Vec<String>,
-    sender: mpsc::Sender<Event>,
+    sender: mpsc::Sender<IncomingMessage>,
     mut event_receiver: mpsc::Receiver<Command>,
     mut signal_receiver: watch::Receiver<bool>,
 ) -> anyhow::Result<usize> {
@@ -28,11 +29,11 @@ pub async fn run_worker(
     let mut attempt_number = 1;
     let mut delay_seconds = std::time::Duration::from_secs(1);
     let maximum_delay_seconds = std::time::Duration::from_secs(30);
-    let mut worker_asset_ids: HashSet<String> = HashSet::new();
+    let mut worker_symbols: HashSet<String> = HashSet::new();
     let mut heartbeat_interval = interval(Duration::from_secs(HEARTBEAT_TIMER_SECONDS));
 
     for key in batch.into_iter() {
-        worker_asset_ids.insert(key);
+        worker_symbols.insert(key);
     }
     heartbeat_interval.tick().await;
 
@@ -48,7 +49,7 @@ pub async fn run_worker(
             let (mut write, mut read) = stream.split();
 
             let payload = serde_json::to_string(&SubscriptionPayload {
-                assets_ids: worker_asset_ids.iter().map(String::from).collect(),
+                assets_ids: worker_symbols.iter().map(String::from).collect(),
                 r#type: "market",
                 custom_feature_enabled: true,
                 initial_dump: true,
@@ -98,28 +99,28 @@ pub async fn run_worker(
                         match update_event {
                             Some(update_event) => {
                                 match update_event {
-                                    Command::MarketResolved { asset_ids } => {
+                                    Command::Unsubscribe { symbols } => {
                                         let payload = serde_json::json!({
                                             "operation": "unsubscribe",
-                                            "assets_ids": asset_ids,
+                                            "assets_ids": symbols,
                                             "custom_feature_enabled": true,
                                         });
                                         write.send(payload.to_string().into()).await?;
-                                        eprintln!("Unsubscribed market of {asset_ids:?} succesfully");
-                                        for id in asset_ids {
-                                            worker_asset_ids.remove(&id);
+                                        eprintln!("Unsubscribed market of {symbols:?} succesfully");
+                                        for id in symbols {
+                                            worker_symbols.remove(&id);
                                         }
                                     },
-                                    Command::NewMarket { asset_ids } => {
+                                    Command::Subscribe { symbols } => {
                                         let payload = serde_json::json!({
                                             "operation": "subscribe",
-                                            "assets_ids": asset_ids,
+                                            "assets_ids": symbols,
                                             "custom_feature_enabled": true,
                                         });
                                         write.send(payload.to_string().into()).await?;
-                                        eprintln!("New market of {asset_ids:?} added succesfully");
-                                        for id in asset_ids {
-                                            worker_asset_ids.insert(id);
+                                        eprintln!("New market of {symbols:?} added succesfully");
+                                        for id in symbols {
+                                            worker_symbols.insert(id);
                                         }
                                     }
                                 }
@@ -137,37 +138,14 @@ pub async fn run_worker(
 
                         match response {
                             Ok(Message::Text(text)) => {
-                                if let Ok(data) = serde_json::from_str::<serde_json::Value>(&text){
-                                    let events = match data {
-                                        serde_json::Value::Array(items) => items.into_iter().collect(),
-                                        serde_json::Value::Object(_) => vec![data],
-                                        _ => vec![],
-                                    };
-
-                                    let received_at = Utc::now();
-                                    for event in events {
-                                        let event_type = event["event_type"]
-                                            .as_str()
-                                            .context("Unable to find event_type")?;
-                                        let event_type = match event_type {
-                                            "book"  => EType::Book,
-                                            "price_change" => EType::PriceChange,
-                                            "new_market" => EType::NewMarket,
-                                            "market_resolved" => EType::MarketResolved,
-                                            _ => {
-                                                continue
-                                            }
-                                        };
-
-                                        let block_event = Event {
-                                            socket_id,
-                                            data: event,
-                                            e_type: event_type,
-                                            received_at,
-                                        };
-
-                                        sender.send(block_event).await?;
-                                    }
+                                let received_at = Utc::now();
+                                let market_events = decode(&text);
+                                if !market_events.is_empty() {
+                                    sender.send(IncomingMessage {
+                                        market_events,
+                                        received_at,
+                                        socket_id,
+                                    }).await?;
                                 }
                             }
                             Ok(other_msg) => eprintln!("Other message received: {other_msg}"),
