@@ -15,31 +15,33 @@ mod exchanges;
 mod handlers;
 mod orderbook;
 mod parse;
+mod snapshot;
 mod subscription;
 mod worker;
 
 use constants::CHUNK_SIZE_64_MEBIBYTES;
 use messages::MarketEvent;
-use orderbook::take_snapshot;
 use worker::run_worker;
 
 use crate::{
     constants::{SNAPSHOT_TIME_SECONDS, SOCKETS_PER_BATCH, WORKER_CHANNEL_SIZE, WORKER_SLEEP_MS},
     exchanges::{polymarket::BATCH_SIZE, *},
     handlers::{add_symbol, apply_level_update, apply_snapshot, remove_symbol},
-    orderbook::{Books, write_snapshot},
+    orderbook::{Books, WriteAction},
     polymarket::discovery::*,
+    snapshot::{take_snapshot, write_snapshot},
     subscription::Subscription,
 };
 
 #[tokio::main]
 async fn main() -> Result<()> {
     // ------ All main variables -----------------------------------------------
-    let symbols = fetch_all_markets().await?;
     let file = std::path::Path::new("/dev/stdout");
     let mut writer = AlignedSbeWriter::create(file, CHUNK_SIZE_64_MEBIBYTES)?;
+
+    let symbols = fetch_all_markets().await?;
     let batches = Subscription::split_into_batches(&symbols, BATCH_SIZE);
-    let mut symbol_books_map = HashMap::new();
+    let mut symbol_books = HashMap::new();
     let mut subscription = Subscription::new(&batches);
 
     let (sender, mut receiver) = mpsc::channel(WORKER_CHANNEL_SIZE);
@@ -55,13 +57,13 @@ async fn main() -> Result<()> {
     // -----------------------------------------------------------------------
 
     for symbol in symbols {
-        symbol_books_map.insert(symbol, Books::new());
+        symbol_books.insert(symbol, Books::new());
     }
 
     tokio::pin!(sigint);
     interval.tick().await;
 
-    eprintln!("Total assets: {}", symbol_books_map.len());
+    eprintln!("Total assets: {}", symbol_books.len());
     eprintln!("Total batches: {}", batches.len());
     for (batch_idx, batch) in batches.into_iter().enumerate() {
         for _ in 0..SOCKETS_PER_BATCH {
@@ -108,7 +110,7 @@ async fn main() -> Result<()> {
 
             _ = interval.tick() => {
                 eprintln!("Creating a snapshot at {}", Utc::now());
-                take_snapshot(&symbol_books_map, &mut writer)?;
+                take_snapshot(&symbol_books, &mut writer)?;
             }
 
             join_result = join_set.join_next(), if can_view_join_result => {
@@ -131,33 +133,16 @@ async fn main() -> Result<()> {
                                 let (new_socket_id, event_receiver) = subscription.register_socket(batch_idx);
 
                                 for asset_id in batch.iter() {
-                                    let Some(books) = symbol_books_map.get_mut(asset_id) else {
+                                    let Some(books) = symbol_books.get_mut(asset_id) else {
                                         continue
                                     };
 
-                                    books.stalled_since = None;
-
-                                    let is_primary_socket = books.primary_socket_id == Some(err_socket_id);
-                                    books.socket_orderbook.remove(&err_socket_id);
-                                    if !is_primary_socket {
-                                        continue;
-                                    }
-
-                                    match books.socket_orderbook.keys().next() {
-                                        Some(other_socket_id) => {
-                                            books.primary_socket_id = Some(*other_socket_id);
-                                            let Some(other_orderbook) = books.socket_orderbook.get(other_socket_id) else {
-                                                eprintln!("Unable to take snapshot of {other_socket_id}'s orderbook");
-                                                continue;
-                                            };
-
-                                            write_snapshot(asset_id, other_orderbook, &mut writer)?;
-                                        },
-                                        None => {
-                                            books.primary_socket_id = None;
+                                    let write_action = books.drop_socket(err_socket_id);
+                                    if write_action == WriteAction::Snapshot {
+                                        if let Some(primary_orderbook) = books.primary_book() {
+                                            write_snapshot(asset_id, primary_orderbook, &mut writer)?;
                                         }
-                                    };
-
+                                    }
                                 }
 
                                 let signal_receiver = signal_receiver.clone();
@@ -201,12 +186,12 @@ async fn main() -> Result<()> {
 
                                     apply_snapshot(
                                         incoming_message.socket_id,
-                                        &mut symbol_books_map,
+                                        &mut symbol_books,
                                         symbol,
                                         exchange_time,
                                         bids,
                                         asks,
-                                    )?;
+                                    );
                                 }
 
                                 MarketEvent::LevelUpdate {
@@ -222,7 +207,7 @@ async fn main() -> Result<()> {
 
                                     apply_level_update(
                                         incoming_message.socket_id,
-                                        &mut symbol_books_map,
+                                        &mut symbol_books,
                                         symbol,
                                         &mut writer,
                                         exchange_time,
@@ -236,7 +221,7 @@ async fn main() -> Result<()> {
                                 MarketEvent::SymbolAdded { symbol } => {
                                     add_symbol(
                                         symbol,
-                                        &mut symbol_books_map,
+                                        &mut symbol_books,
                                         &mut subscription,
                                     );
                                 }
@@ -244,7 +229,7 @@ async fn main() -> Result<()> {
                                 MarketEvent::SymbolRemoved { symbol } => {
                                     remove_symbol(
                                         symbol,
-                                        &mut symbol_books_map,
+                                        &mut symbol_books,
                                         &mut subscription,
                                     );
                                 }

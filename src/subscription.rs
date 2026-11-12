@@ -81,10 +81,6 @@ impl Subscription {
         Some(batch_idx)
     }
 
-    pub fn fetch_symbol_batch(&self, symbol: &str) -> Option<usize> {
-        self.symbol_batch_map.get(symbol).copied()
-    }
-
     pub fn release_symbol(&mut self, symbol: &str) -> Option<usize> {
         self.symbol_batch_map.remove(symbol)
     }

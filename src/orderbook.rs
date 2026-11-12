@@ -1,26 +1,15 @@
 use std::collections::{BTreeMap, HashMap};
 
-use chrono::{DateTime, Utc};
-use engineering_challenge::util::{
-    AlignedSbeWriter,
-    dtos::challenge_orderbook::{SnapshotAsksEntryDomain, SnapshotBidsEntryDomain, SnapshotDomain},
-};
+use chrono::{DateTime, TimeDelta, Utc};
+use engineering_challenge::Side;
 
-#[derive(Debug)]
-pub struct Books {
-    pub socket_orderbook: HashMap<usize, Orderbook>,
-    pub primary_socket_id: Option<usize>,
-    pub stalled_since: Option<DateTime<Utc>>,
-}
+use crate::{constants::STALL_TIMER_SECONDS, messages::Level};
 
-impl Books {
-    pub fn new() -> Self {
-        Self {
-            socket_orderbook: HashMap::new(),
-            primary_socket_id: None,
-            stalled_since: None,
-        }
-    }
+#[derive(Debug, PartialEq)]
+pub enum WriteAction {
+    Snapshot,
+    Update,
+    Nothing,
 }
 
 #[derive(Debug)]
@@ -39,54 +28,129 @@ impl Orderbook {
         }
     }
 }
-pub fn write_snapshot(
-    asset_id: &str,
-    orderbook: &Orderbook,
-    writer: &mut AlignedSbeWriter,
-) -> anyhow::Result<()> {
-    let mut asks = vec![];
-    for (price_level, quantity) in orderbook.asks.iter() {
-        asks.push(SnapshotAsksEntryDomain {
-            price_level: *price_level,
-            quantity: *quantity,
-        })
-    }
 
-    let mut bids = vec![];
-    for (price_level, quantity) in orderbook.bids.iter().rev() {
-        bids.push(SnapshotBidsEntryDomain {
-            price_level: *price_level,
-            quantity: *quantity,
-        })
-    }
-
-    let snapshot = SnapshotDomain {
-        asks,
-        bids,
-        exchange_timestamp: orderbook.timestamp,
-        received_at: chrono::Utc::now(),
-        symbol: asset_id.to_owned(),
-    };
-    writer.write_msg(&snapshot)?;
-
-    Ok(())
+#[derive(Debug)]
+pub struct Books {
+    pub socket_orderbook: HashMap<usize, Orderbook>,
+    pub primary_socket_id: Option<usize>,
+    pub stalled_since: Option<DateTime<Utc>>,
 }
 
-pub fn take_snapshot(
-    assets_ids: &HashMap<String, Books>,
-    writer: &mut AlignedSbeWriter,
-) -> anyhow::Result<()> {
-    for (asset_id, books) in assets_ids.iter() {
-        let Some(primary_socket_id) = books.primary_socket_id else {
-            eprintln!("Skipping {asset_id} since no socket present");
-            continue;
-        };
-
-        let Some(orderbook) = books.socket_orderbook.get(&primary_socket_id) else {
-            continue;
-        };
-
-        write_snapshot(asset_id, orderbook, writer)?;
+impl Books {
+    pub fn new() -> Self {
+        Self {
+            socket_orderbook: HashMap::new(),
+            primary_socket_id: None,
+            stalled_since: None,
+        }
     }
-    Ok(())
+
+    pub fn primary_book(&self) -> Option<&Orderbook> {
+        let Some(socket_id) = self.primary_socket_id else {
+            return None;
+        };
+
+        self.socket_orderbook.get(&socket_id)
+    }
+
+    pub fn drop_socket(&mut self, socket_id: usize) -> WriteAction {
+        self.stalled_since = None;
+        let is_primary_socket = self.primary_socket_id == Some(socket_id);
+        self.socket_orderbook.remove(&socket_id);
+        if !is_primary_socket {
+            return WriteAction::Nothing;
+        }
+
+        match self.socket_orderbook.keys().next() {
+            Some(other_socket_id) => {
+                self.primary_socket_id = Some(*other_socket_id);
+                return WriteAction::Snapshot;
+            }
+            None => {
+                self.primary_socket_id = None;
+                return WriteAction::Nothing;
+            }
+        };
+    }
+
+    pub fn apply_snapshot(
+        &mut self,
+        socket_id: usize,
+        timestamp: DateTime<Utc>,
+        bids: Vec<Level>,
+        asks: Vec<Level>,
+    ) {
+        if self.primary_socket_id.is_none() {
+            self.primary_socket_id = Some(socket_id);
+        }
+
+        let asks: BTreeMap<i64, i64> = asks
+            .into_iter()
+            .map(|level| (level.price, level.quantity))
+            .collect();
+
+        let bids: BTreeMap<i64, i64> = bids
+            .into_iter()
+            .map(|level| (level.price, level.quantity))
+            .collect();
+
+        let mut orderbook = Orderbook::new();
+        orderbook.timestamp = timestamp;
+        orderbook.asks = asks;
+        orderbook.bids = bids;
+
+        self.socket_orderbook.insert(socket_id, orderbook);
+    }
+
+    pub fn apply_update(
+        &mut self,
+        socket_id: usize,
+        timestamp: DateTime<Utc>,
+        side: Side,
+        price: i64,
+        quantity: i64,
+        received_at: DateTime<Utc>,
+    ) -> WriteAction {
+        if self.primary_socket_id.is_none() {
+            self.primary_socket_id = Some(socket_id);
+        }
+
+        let orderbook = self
+            .socket_orderbook
+            .entry(socket_id)
+            .or_insert_with(|| Orderbook::new());
+
+        orderbook.timestamp = timestamp;
+
+        let book_side = match side {
+            Side::Buy => &mut orderbook.bids,
+            Side::Sell => &mut orderbook.asks,
+        };
+        if quantity == 0 {
+            book_side.remove(&price);
+        } else {
+            book_side.insert(price, quantity);
+        }
+
+        if self.primary_socket_id == Some(socket_id) {
+            self.stalled_since = None;
+            return WriteAction::Update;
+        }
+
+        match self.stalled_since {
+            None => {
+                self.stalled_since = Some(received_at);
+                return WriteAction::Nothing;
+            }
+            Some(t) => {
+                let time_elapsed = received_at - t;
+                if time_elapsed >= TimeDelta::seconds(STALL_TIMER_SECONDS) {
+                    self.primary_socket_id = Some(socket_id);
+                    self.stalled_since = None;
+                    return WriteAction::Snapshot;
+                }
+                return WriteAction::Nothing;
+            }
+        }
+    }
 }
