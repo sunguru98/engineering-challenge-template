@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 
 use anyhow::Result;
 use chrono::{DateTime, TimeDelta, Utc};
@@ -9,11 +9,11 @@ use engineering_challenge::util::dtos::challenge_orderbook::PriceLevelUpdateDoma
 use crate::constants::STALL_TIMER_SECONDS;
 use crate::messages::{Command, Level};
 use crate::orderbook::{Books, Orderbook, write_snapshot};
-use crate::types::{BatchSocketIdsMap, SocketEventSenderMap, SymbolBatchMap, SymbolBooksMap};
+use crate::subscription::Subscription;
 
 pub fn apply_snapshot(
     socket_id: usize,
-    symbol_books_map: &mut SymbolBooksMap,
+    symbol_books_map: &mut HashMap<String, Books>,
     symbol: String,
     timestamp: DateTime<Utc>,
     bids: Vec<Level>,
@@ -49,7 +49,7 @@ pub fn apply_snapshot(
 
 pub fn apply_level_update(
     socket_id: usize,
-    symbol_books_map: &mut SymbolBooksMap,
+    symbol_books_map: &mut HashMap<String, Books>,
     symbol: String,
     writer: &mut AlignedSbeWriter,
     timestamp: DateTime<Utc>,
@@ -114,74 +114,46 @@ pub fn apply_level_update(
 
 pub fn add_symbol(
     symbol: String,
-    symbol_books_map: &mut SymbolBooksMap,
-    symbol_batch_map: &mut SymbolBatchMap,
-    socket_event_sender_map: &SocketEventSenderMap,
-    batch_socket_ids_map: &BatchSocketIdsMap,
-    next_batch_idx: &mut usize,
-    batches_len: usize,
+    symbol_books_map: &mut HashMap<String, Books>,
+    subscription: &mut Subscription,
 ) {
     if symbol_books_map.contains_key(&symbol) {
         return;
     }
 
-    let batch_idx = *next_batch_idx;
-    symbol_books_map.insert(symbol.clone(), Books::new());
-    symbol_batch_map.insert(symbol.clone(), batch_idx);
-    *next_batch_idx = (batch_idx + 1) % batches_len;
-
-    let Some(socket_ids) = batch_socket_ids_map.get(&batch_idx) else {
-        eprintln!("No websockets found for new_market");
+    let Some(batch_idx) = subscription.assign_symbol(&symbol) else {
         return;
     };
 
-    for socket_id in socket_ids {
-        let Some(event_sender) = socket_event_sender_map.get(socket_id) else {
-            eprintln!("[new_market] Socket #{socket_id} not found");
-            continue;
-        };
-
-        if let Err(err) = event_sender.try_send(Command::Subscribe {
-            symbols: vec![symbol.clone()],
-        }) {
-            eprintln!("Error sending new_market event: {err:?}");
-            continue;
-        };
-    }
+    symbol_books_map.insert(symbol.clone(), Books::new());
+    subscription.broadcast_to_batch(
+        batch_idx,
+        Command::Subscribe {
+            symbols: vec![symbol],
+        },
+    );
 }
 
 pub fn remove_symbol(
     symbol: String,
-    symbol_books_map: &mut SymbolBooksMap,
-    symbol_batch_map: &mut SymbolBatchMap,
-    socket_event_sender_map: &SocketEventSenderMap,
-    batch_socket_ids_map: &BatchSocketIdsMap,
+    symbol_books_map: &mut HashMap<String, Books>,
+    subscription: &mut Subscription,
 ) {
     if !symbol_books_map.contains_key(&symbol) {
         return;
     }
-    let Some(&batch_idx) = symbol_batch_map.get(&symbol) else {
+
+    let Some(batch_idx) = subscription.fetch_symbol_batch(&symbol) else {
         return;
     };
 
     symbol_books_map.remove(&symbol);
-    symbol_batch_map.remove(&symbol);
+    subscription.release_symbol(&symbol);
 
-    let Some(socket_ids) = batch_socket_ids_map.get(&batch_idx) else {
-        return;
-    };
-
-    for socket_id in socket_ids {
-        let Some(event_sender) = socket_event_sender_map.get(socket_id) else {
-            eprintln!("[market_resolved] Socket #{socket_id} not found");
-            continue;
-        };
-
-        if let Err(err) = event_sender.try_send(Command::Unsubscribe {
-            symbols: vec![symbol.clone()],
-        }) {
-            eprintln!("Error sending market_resolved event: {err:?}");
-            continue;
-        };
-    }
+    subscription.broadcast_to_batch(
+        batch_idx,
+        Command::Unsubscribe {
+            symbols: vec![symbol],
+        },
+    );
 }

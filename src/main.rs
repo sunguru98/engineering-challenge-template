@@ -1,7 +1,4 @@
-use std::{
-    collections::{HashMap, HashSet},
-    time::Duration,
-};
+use std::{collections::HashMap, time::Duration};
 
 use anyhow::Result;
 use chrono::Utc;
@@ -13,76 +10,73 @@ use tokio::{
     time::{interval, sleep},
 };
 
-mod assets;
 mod constants;
 mod exchanges;
 mod handlers;
 mod orderbook;
 mod parse;
-mod types;
+mod subscription;
 mod worker;
 
-use assets::fetch_symbols;
 use constants::CHUNK_SIZE_64_MEBIBYTES;
 use messages::MarketEvent;
 use orderbook::take_snapshot;
 use worker::run_worker;
 
 use crate::{
-    constants::{
-        SNAPSHOT_TIME_SECONDS, SOCKETS_PER_BATCH, UPDATE_EVENT_CHANNEL_SIZE, WORKER_CHANNEL_SIZE,
-        WORKER_SLEEP_MS,
-    },
-    exchanges::*,
+    constants::{SNAPSHOT_TIME_SECONDS, SOCKETS_PER_BATCH, WORKER_CHANNEL_SIZE, WORKER_SLEEP_MS},
+    exchanges::{polymarket::BATCH_SIZE, *},
     handlers::{add_symbol, apply_level_update, apply_snapshot, remove_symbol},
-    orderbook::write_snapshot,
+    orderbook::{Books, write_snapshot},
     polymarket::discovery::*,
+    subscription::Subscription,
 };
 
 #[tokio::main]
 async fn main() -> Result<()> {
     // ------ All main variables -----------------------------------------------
-    let token_ids = fetch_all_markets().await?;
+    let symbols = fetch_all_markets().await?;
     let file = std::path::Path::new("/dev/stdout");
     let mut writer = AlignedSbeWriter::create(file, CHUNK_SIZE_64_MEBIBYTES)?;
-    let (mut symbol_books_map, batches, mut symbol_batch_map) = fetch_symbols(token_ids)?;
-    let batches_len = batches.len();
+    let batches = Subscription::split_into_batches(&symbols, BATCH_SIZE);
+    let mut symbol_books_map = HashMap::new();
+    let mut subscription = Subscription::new(&batches);
+
     let (sender, mut receiver) = mpsc::channel(WORKER_CHANNEL_SIZE);
     let (signal_sender, signal_receiver) = watch::channel(false);
     let mut interval = interval(Duration::from_secs(SNAPSHOT_TIME_SECONDS));
+
     let mut shutting_down = false;
     let mut all_events_processed = false;
     let mut work_complete = false;
-    let mut next_batch_idx = 0;
+
     let sigint = signal::ctrl_c();
     let mut join_set = JoinSet::new();
-    let mut socket_id = 0usize;
-
-    let mut batch_socket_ids_map = HashMap::new();
-    let mut socket_event_sender_map = HashMap::new();
     // -----------------------------------------------------------------------
+
+    for symbol in symbols {
+        symbol_books_map.insert(symbol, Books::new());
+    }
 
     tokio::pin!(sigint);
     interval.tick().await;
 
     eprintln!("Total assets: {}", symbol_books_map.len());
-    eprintln!("Total batches: {batches_len}");
+    eprintln!("Total batches: {}", batches.len());
     for (batch_idx, batch) in batches.into_iter().enumerate() {
-        let mut socket_ids = HashSet::new();
-
         for _ in 0..SOCKETS_PER_BATCH {
-            let (event_sender, event_receiver) = mpsc::channel(UPDATE_EVENT_CHANNEL_SIZE);
             let batch = batch.clone();
             let signal_receiver = signal_receiver.clone();
             let sender = sender.clone();
 
-            socket_event_sender_map.insert(socket_id, event_sender);
-            socket_ids.insert(socket_id);
-
+            let (new_socket_id, event_receiver) = subscription.register_socket(batch_idx);
             join_set.spawn(async move {
-                sleep(Duration::from_millis(socket_id as u64 * WORKER_SLEEP_MS)).await;
+                sleep(Duration::from_millis(
+                    (new_socket_id as u64) * WORKER_SLEEP_MS,
+                ))
+                .await;
                 run_worker(
-                    socket_id,
+                    new_socket_id,
                     batch_idx,
                     batch,
                     sender,
@@ -90,13 +84,9 @@ async fn main() -> Result<()> {
                     signal_receiver,
                 )
                 .await
-                .map_err(|e| (socket_id, batch_idx, e))
+                .map_err(|e| (new_socket_id, batch_idx, e))
             });
-
-            socket_id += 1;
         }
-
-        batch_socket_ids_map.insert(batch_idx, socket_ids);
     }
 
     let mut main_sender = Some(sender);
@@ -134,68 +124,55 @@ async fn main() -> Result<()> {
                         eprintln!("Websocket #{err_socket_id} for batch #{batch_idx} finished with error: {err:?}");
                         if !shutting_down {
                             eprintln!("Retrying Websocket #{batch_idx}");
-                            let batch: Vec<String> = symbol_batch_map
-                                .iter()
-                                .filter(|&(_, &idx)| idx == batch_idx)
-                                .map(|(asset, _)| asset.clone())
-                                .collect();
+                            let batch: Vec<String> = subscription.symbols_in_batch(batch_idx);
+                            subscription.remove_socket(batch_idx, err_socket_id);
 
+                            if let Some(main_sender) = main_sender.clone() {
+                                let (new_socket_id, event_receiver) = subscription.register_socket(batch_idx);
 
-                            let (event_sender, event_receiver) = mpsc::channel(UPDATE_EVENT_CHANNEL_SIZE);
-                            socket_event_sender_map.remove(&err_socket_id);
+                                for asset_id in batch.iter() {
+                                    let Some(books) = symbol_books_map.get_mut(asset_id) else {
+                                        continue
+                                    };
 
-                            if let Some(socket_ids) = batch_socket_ids_map.get_mut(&batch_idx) {
-                                socket_ids.remove(&err_socket_id);
-                                if let Some(main_sender) = main_sender.clone() {
-                                    socket_event_sender_map.insert(socket_id, event_sender);
-                                    socket_ids.insert(socket_id);
+                                    books.stalled_since = None;
 
-                                    for asset_id in batch.iter() {
-                                        let Some(books) = symbol_books_map.get_mut(asset_id) else {
-                                            continue
-                                        };
-
-                                        books.stalled_since = None;
-
-                                        let is_primary_socket = books.primary_socket_id == Some(err_socket_id);
-                                        books.socket_orderbook.remove(&err_socket_id);
-                                        if !is_primary_socket {
-                                            continue;
-                                        }
-
-                                        match books.socket_orderbook.keys().next() {
-                                            Some(other_socket_id) => {
-                                                books.primary_socket_id = Some(*other_socket_id);
-                                                let Some(other_orderbook) = books.socket_orderbook.get(other_socket_id) else {
-                                                    eprintln!("Unable to take snapshot of {other_socket_id}'s orderbook");
-                                                    continue;
-                                                };
-
-                                                write_snapshot(asset_id, other_orderbook, &mut writer)?;
-                                            },
-                                            None => {
-                                                books.primary_socket_id = None;
-                                            }
-                                        };
-
+                                    let is_primary_socket = books.primary_socket_id == Some(err_socket_id);
+                                    books.socket_orderbook.remove(&err_socket_id);
+                                    if !is_primary_socket {
+                                        continue;
                                     }
 
-                                    let signal_receiver = signal_receiver.clone();
-                                    join_set.spawn(async move {
-                                        run_worker(
-                                            socket_id,
-                                            batch_idx,
-                                            batch,
-                                            main_sender,
-                                            event_receiver,
-                                            signal_receiver,
-                                        )
-                                        .await
-                                        .map_err(|e| (socket_id, batch_idx, e))
-                                    });
+                                    match books.socket_orderbook.keys().next() {
+                                        Some(other_socket_id) => {
+                                            books.primary_socket_id = Some(*other_socket_id);
+                                            let Some(other_orderbook) = books.socket_orderbook.get(other_socket_id) else {
+                                                eprintln!("Unable to take snapshot of {other_socket_id}'s orderbook");
+                                                continue;
+                                            };
 
-                                    socket_id += 1;
+                                            write_snapshot(asset_id, other_orderbook, &mut writer)?;
+                                        },
+                                        None => {
+                                            books.primary_socket_id = None;
+                                        }
+                                    };
+
                                 }
+
+                                let signal_receiver = signal_receiver.clone();
+                                join_set.spawn(async move {
+                                    run_worker(
+                                        new_socket_id,
+                                        batch_idx,
+                                        batch,
+                                        main_sender,
+                                        event_receiver,
+                                        signal_receiver,
+                                    )
+                                    .await
+                                    .map_err(|e| (new_socket_id, batch_idx, e))
+                                });
                             }
                         }
                     },
@@ -218,7 +195,7 @@ async fn main() -> Result<()> {
                                     bids,
                                     exchange_time,
                                 } => {
-                                    if !socket_event_sender_map.contains_key(&incoming_message.socket_id) {
+                                    if !subscription.is_socket_alive(incoming_message.socket_id) {
                                         continue;
                                     }
 
@@ -239,7 +216,7 @@ async fn main() -> Result<()> {
                                     side,
                                     symbol,
                                 } => {
-                                    if !socket_event_sender_map.contains_key(&incoming_message.socket_id) {
+                                    if !subscription.is_socket_alive(incoming_message.socket_id) {
                                         continue;
                                     }
 
@@ -260,11 +237,7 @@ async fn main() -> Result<()> {
                                     add_symbol(
                                         symbol,
                                         &mut symbol_books_map,
-                                        &mut symbol_batch_map,
-                                        &socket_event_sender_map,
-                                        &batch_socket_ids_map,
-                                        &mut next_batch_idx,
-                                        batches_len,
+                                        &mut subscription,
                                     );
                                 }
 
@@ -272,9 +245,7 @@ async fn main() -> Result<()> {
                                     remove_symbol(
                                         symbol,
                                         &mut symbol_books_map,
-                                        &mut symbol_batch_map,
-                                        &socket_event_sender_map,
-                                        &batch_socket_ids_map,
+                                        &mut subscription,
                                     );
                                 }
                             }

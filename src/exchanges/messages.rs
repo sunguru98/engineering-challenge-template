@@ -1,7 +1,7 @@
 use chrono::{DateTime, Utc};
 use engineering_challenge::Side;
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum Command {
     Unsubscribe { symbols: Vec<String> },
     Subscribe { symbols: Vec<String> },

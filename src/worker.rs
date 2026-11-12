@@ -1,7 +1,7 @@
 use std::collections::HashSet;
 use std::time::Duration;
 
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use futures_util::{SinkExt, StreamExt};
 use rand::RngExt;
 use tokio::{
@@ -12,10 +12,19 @@ use tokio_tungstenite::{connect_async, tungstenite::Message};
 
 use crate::{
     constants::{MAX_ATTEMPTS, STABLE_CHECK_SECONDS},
+    exchanges::{
+        messages::MarketEvent,
+        polymarket::{encode_command, encode_heartbeat_message, encode_initial_subscribe},
+    },
     messages::Command,
     polymarket::{HEARTBEAT_TIMER_SECONDS, WS_URL, decode},
-    types::{IncomingMessage, SubscriptionPayload},
 };
+
+pub struct IncomingMessage {
+    pub socket_id: usize,
+    pub received_at: DateTime<Utc>,
+    pub market_events: Vec<MarketEvent>,
+}
 
 pub async fn run_worker(
     socket_id: usize,
@@ -48,12 +57,7 @@ pub async fn run_worker(
 
             let (mut write, mut read) = stream.split();
 
-            let payload = serde_json::to_string(&SubscriptionPayload {
-                assets_ids: worker_symbols.iter().map(String::from).collect(),
-                r#type: "market",
-                custom_feature_enabled: true,
-                initial_dump: true,
-            })?;
+            let payload = encode_initial_subscribe(&worker_symbols);
 
             write
                 .send(Message::Text(
@@ -92,32 +96,23 @@ pub async fn run_worker(
                         }
                     }
                     _ = heartbeat_interval.tick() => {
-                        write.send(Message::Text("PING".into())).await?;
+                        write.send(encode_heartbeat_message()).await?;
                     }
 
-                    update_event = event_receiver.recv(), if !event_sender_closed => {
-                        match update_event {
-                            Some(update_event) => {
-                                match update_event {
+                    command = event_receiver.recv(), if !event_sender_closed => {
+                        match command {
+                            Some(command) => {
+                                let payload = encode_command(&command);
+                                match command {
                                     Command::Unsubscribe { symbols } => {
-                                        let payload = serde_json::json!({
-                                            "operation": "unsubscribe",
-                                            "assets_ids": symbols,
-                                            "custom_feature_enabled": true,
-                                        });
-                                        write.send(payload.to_string().into()).await?;
+                                        write.send(payload.into()).await?;
                                         eprintln!("Unsubscribed market of {symbols:?} succesfully");
                                         for id in symbols {
                                             worker_symbols.remove(&id);
                                         }
                                     },
                                     Command::Subscribe { symbols } => {
-                                        let payload = serde_json::json!({
-                                            "operation": "subscribe",
-                                            "assets_ids": symbols,
-                                            "custom_feature_enabled": true,
-                                        });
-                                        write.send(payload.to_string().into()).await?;
+                                        write.send(payload.into()).await?;
                                         eprintln!("New market of {symbols:?} added succesfully");
                                         for id in symbols {
                                             worker_symbols.insert(id);
