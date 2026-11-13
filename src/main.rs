@@ -10,27 +10,24 @@ use tokio::{
     time::{interval, sleep},
 };
 
+mod collector;
 mod constants;
 mod exchanges;
-mod handlers;
-mod orderbook;
-mod parse;
-mod snapshot;
-mod subscription;
-mod worker;
 
 use constants::CHUNK_SIZE_64_MEBIBYTES;
 use messages::MarketEvent;
-use worker::run_worker;
 
 use crate::{
+    collector::{
+        handlers::{add_symbol, apply_level_update, apply_snapshot, remove_symbol},
+        orderbook::{Books, WriteAction},
+        snapshot::{take_snapshot, write_snapshot},
+        subscription::Subscription,
+        worker::run_worker,
+    },
     constants::{SNAPSHOT_TIME_SECONDS, SOCKETS_PER_BATCH, WORKER_CHANNEL_SIZE, WORKER_SLEEP_MS},
     exchanges::{polymarket::BATCH_SIZE, *},
-    handlers::{add_symbol, apply_level_update, apply_snapshot, remove_symbol},
-    orderbook::{Books, WriteAction},
     polymarket::discovery::*,
-    snapshot::{take_snapshot, write_snapshot},
-    subscription::Subscription,
 };
 
 #[tokio::main]

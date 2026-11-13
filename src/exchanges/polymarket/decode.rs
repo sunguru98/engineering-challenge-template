@@ -3,8 +3,11 @@ use chrono::{DateTime, Utc};
 use serde::Deserialize;
 use serde_json::Value;
 
-use crate::messages::{Level, MarketEvent};
-use crate::parse::convert_to_schema_int;
+use crate::{
+    messages::{Level, MarketEvent},
+    parse::convert_to_schema_int,
+};
+
 use engineering_challenge::Side;
 
 #[derive(Deserialize, Debug)]

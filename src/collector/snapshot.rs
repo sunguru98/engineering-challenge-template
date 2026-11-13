@@ -5,7 +5,7 @@ use engineering_challenge::util::{
     dtos::challenge_orderbook::{SnapshotAsksEntryDomain, SnapshotBidsEntryDomain, SnapshotDomain},
 };
 
-use crate::orderbook::{Books, Orderbook};
+use crate::collector::orderbook::{Books, Orderbook};
 
 pub fn write_snapshot(
     symbol: &str,
