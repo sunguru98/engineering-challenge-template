@@ -13,11 +13,12 @@ use tokio_tungstenite::{connect_async, tungstenite::Message};
 use crate::{
     constants::{MAX_ATTEMPTS, STABLE_CHECK_SECONDS},
     exchanges::{
-        messages::MarketEvent,
-        polymarket::{encode_command, encode_heartbeat_message, encode_initial_subscribe},
+        messages::{Command, MarketEvent},
+        polymarket::{
+            HEARTBEAT_TIMER_SECONDS, WS_URL, decode, encode_command, encode_heartbeat_message,
+            encode_initial_subscribe,
+        },
     },
-    messages::Command,
-    polymarket::{HEARTBEAT_TIMER_SECONDS, WS_URL, decode},
 };
 
 pub struct IncomingMessage {

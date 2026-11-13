@@ -6,12 +6,14 @@ use engineering_challenge::Side;
 use engineering_challenge::util::AlignedSbeWriter;
 use engineering_challenge::util::dtos::challenge_orderbook::PriceLevelUpdateDomain;
 
-use crate::collector::{
-    orderbook::{Books, WriteAction},
-    snapshot::write_snapshot,
-    subscription::Subscription,
+use crate::{
+    collector::{
+        orderbook::{Books, WriteAction},
+        snapshot::write_snapshot,
+        subscription::Subscription,
+    },
+    exchanges::messages::{Command, Level},
 };
-use crate::messages::{Command, Level};
 
 pub fn apply_snapshot(
     socket_id: usize,

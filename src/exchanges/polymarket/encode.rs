@@ -1,6 +1,6 @@
 use tokio_tungstenite::tungstenite::Message;
 
-use crate::messages::Command;
+use crate::exchanges::messages::Command;
 use std::collections::HashSet;
 
 pub fn encode_initial_subscribe(symbols: &HashSet<String>) -> String {

@@ -3,7 +3,7 @@ use std::collections::{BTreeMap, HashMap};
 use chrono::{DateTime, TimeDelta, Utc};
 use engineering_challenge::Side;
 
-use crate::{constants::STALL_TIMER_SECONDS, messages::Level};
+use crate::{constants::STALL_TIMER_SECONDS, exchanges::messages::Level};
 
 #[derive(Debug, PartialEq)]
 pub enum WriteAction {
@@ -31,9 +31,9 @@ impl Orderbook {
 
 #[derive(Debug)]
 pub struct Books {
-    pub socket_orderbook: HashMap<usize, Orderbook>,
-    pub primary_socket_id: Option<usize>,
-    pub stalled_since: Option<DateTime<Utc>>,
+    socket_orderbook: HashMap<usize, Orderbook>,
+    primary_socket_id: Option<usize>,
+    stalled_since: Option<DateTime<Utc>>,
 }
 
 impl Books {
