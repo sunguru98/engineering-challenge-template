@@ -21,11 +21,8 @@ use crate::{
     backoff::Backoff,
     constants::{CLOSE_REPLY_TIMEOUT_SECONDS, STABLE_CHECK_SECONDS},
     exchanges::{
+        adapter::Adapter,
         messages::{Command, MarketEvent},
-        polymarket::{
-            HEARTBEAT_TIMER_SECONDS, WS_URL, decode, encode_command, encode_heartbeat_message,
-            encode_initial_subscribe,
-        },
     },
 };
 
@@ -36,7 +33,8 @@ pub struct IncomingMessage {
     pub received_at: DateTime<Utc>,
     pub market_events: Vec<MarketEvent>,
 }
-pub struct Worker {
+pub struct Worker<Exchange> {
+    exchange: Exchange,
     socket_id: usize,
     batch_idx: usize,
     sender: mpsc::Sender<IncomingMessage>,
@@ -48,8 +46,12 @@ pub struct Worker {
     backoff: Backoff,
 }
 
-impl Worker {
+impl<Exchange> Worker<Exchange>
+where
+    Exchange: Adapter,
+{
     pub fn new(
+        exchange: Exchange,
         socket_id: usize,
         batch_idx: usize,
         batch: Vec<String>,
@@ -58,12 +60,14 @@ impl Worker {
         signal_receiver: watch::Receiver<bool>,
     ) -> Self {
         let symbols = batch.into_iter().collect::<HashSet<String>>();
+        let heartbeat_timer = interval(exchange.heartbeat_interval());
         Self {
+            exchange,
             backoff: Backoff::new(),
             batch_idx,
             command_receiver,
             command_closed: false,
-            heartbeat_timer: interval(Duration::from_secs(HEARTBEAT_TIMER_SECONDS)),
+            heartbeat_timer,
             sender,
             signal_receiver,
             socket_id,
@@ -104,9 +108,9 @@ impl Worker {
     }
 
     async fn run_session(&mut self) -> Result<()> {
-        let (stream, _) = connect_async(WS_URL).await?;
+        let (stream, _) = connect_async(self.exchange.websocket_url()).await?;
         let (mut write, mut read) = stream.split();
-        let payload = encode_initial_subscribe(&self.symbols);
+        let payload = self.exchange.initial_subscribe(&self.symbols);
         write.send(Message::Text(payload.into())).await?;
 
         eprintln!(
@@ -123,7 +127,7 @@ impl Worker {
                     }
                 }
                 _ = self.heartbeat_timer.tick() => {
-                    write.send(encode_heartbeat_message()).await?;
+                    write.send(self.exchange.heartbeat_message()).await?;
                 }
 
                 command = self.command_receiver.recv(), if !self.command_closed => {
@@ -158,7 +162,7 @@ impl Worker {
         match message {
             Text(text) => {
                 let received_at = Utc::now();
-                let market_events = decode(&text);
+                let market_events = self.exchange.decode(&text);
                 if !market_events.is_empty() {
                     self.sender
                         .send(IncomingMessage {
@@ -212,7 +216,7 @@ impl Worker {
     }
 
     fn handle_command(&mut self, command: Command) -> String {
-        let payload = encode_command(&command);
+        let payload = self.exchange.encode_command(&command);
         match command {
             Command::Unsubscribe { symbols } => {
                 eprintln!("Sending Unsubscribe market of {symbols:?}");

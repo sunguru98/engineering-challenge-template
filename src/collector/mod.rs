@@ -26,8 +26,8 @@ use crate::{
         WORKER_SLEEP_MS,
     },
     exchanges::{
+        adapter::Adapter,
         messages::{Command, MarketEvent},
-        polymarket::BATCH_SIZE,
     },
 };
 
@@ -38,7 +38,8 @@ pub mod subscription;
 pub mod worker;
 
 type JoinsetType = Result<(usize, usize), (usize, usize, Error)>;
-pub struct Collector {
+pub struct Collector<Exchange> {
+    exchange: Exchange,
     writer: AlignedSbeWriter,
     symbol_books: HashMap<String, Books>,
     subscription: Subscription,
@@ -59,12 +60,15 @@ pub struct Collector {
     work_complete: bool,
 }
 
-impl Collector {
-    pub fn new(symbols: Vec<String>) -> Result<Self> {
+impl<Exchange> Collector<Exchange>
+where
+    Exchange: Adapter,
+{
+    pub fn new(exchange: Exchange, symbols: Vec<String>) -> Result<Self> {
         let file = std::path::Path::new("/dev/stdout");
         let writer = AlignedSbeWriter::create(file, CHUNK_SIZE_64_MEBIBYTES)?;
 
-        let batches = Subscription::split_into_batches(&symbols, BATCH_SIZE);
+        let batches = Subscription::split_into_batches(&symbols, exchange.symbols_per_socket());
         let subscription = Subscription::new(&batches);
 
         let mut symbol_books = HashMap::new();
@@ -82,6 +86,7 @@ impl Collector {
         eprintln!("Total batches: {}", batches.len());
 
         let mut collector = Self {
+            exchange,
             writer,
             subscription,
             main_sender: Some(sender.clone()),
@@ -161,10 +166,12 @@ impl Collector {
         command_receiver: mpsc::Receiver<Command>,
     ) {
         let signal_receiver = self.signal_receiver.clone();
+        let exchange = self.exchange.clone();
 
         self.join_set.spawn(async move {
             sleep(startup_delay).await;
             let worker = Worker::new(
+                exchange,
                 new_socket_id,
                 batch_idx,
                 batch,

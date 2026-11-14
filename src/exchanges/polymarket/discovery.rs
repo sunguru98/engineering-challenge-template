@@ -2,7 +2,7 @@ use rand::RngExt;
 
 use crate::{
     constants::MAX_ATTEMPTS,
-    exchanges::polymarket::{HTTP_URL, MAX_EVENTS_FETCH},
+    exchanges::polymarket::constants::{HTTP_URL, MAX_EVENTS_FETCH},
 };
 
 async fn fetch_page(
