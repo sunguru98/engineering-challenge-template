@@ -19,7 +19,7 @@ use crate::{
         orderbook::{Books, WriteAction},
         snapshot::{take_snapshot, write_snapshot},
         subscription::Subscription,
-        worker::{IncomingMessage, run_worker},
+        worker::{IncomingMessage, Worker},
     },
     constants::{
         CHUNK_SIZE_64_MEBIBYTES, SNAPSHOT_TIME_SECONDS, SOCKETS_PER_BATCH, WORKER_CHANNEL_SIZE,
@@ -98,7 +98,7 @@ impl Collector {
 
         for (batch_idx, batch) in batches.into_iter().enumerate() {
             for _ in 0..SOCKETS_PER_BATCH {
-                let (new_socket_id, event_receiver) =
+                let (new_socket_id, command_receiver) =
                     collector.subscription.register_socket(batch_idx);
                 let startup_delay = Duration::from_millis((new_socket_id as u64) * WORKER_SLEEP_MS);
 
@@ -108,12 +108,47 @@ impl Collector {
                     batch_idx,
                     batch.clone(),
                     sender.clone(),
-                    event_receiver,
+                    command_receiver,
                 );
             }
         }
 
         Ok(collector)
+    }
+
+    pub async fn run(&mut self) -> Result<()> {
+        let sigint = signal::ctrl_c();
+        tokio::pin!(sigint);
+
+        self.snapshot_timer.tick().await;
+
+        loop {
+            let can_shutdown =
+                self.shutting_down && self.all_events_processed && self.work_complete;
+            let can_view_join_result =
+                !self.work_complete && (self.shutting_down || !self.join_set.is_empty());
+
+            if can_shutdown {
+                break;
+            }
+
+            tokio::select! {
+                _ = &mut sigint, if !self.shutting_down => self.begin_shutdown()?,
+                _ = self.snapshot_timer.tick() => self.snapshot()?,
+                join_result = self.join_set.join_next(), if can_view_join_result => self.handle_worker_result(join_result)?,
+                incoming_message = self.receiver.recv(), if !self.all_events_processed => {
+                    match incoming_message {
+                        None => {
+                            self.all_events_processed = true;
+                        }
+                        Some(incoming_message) => self.handle_incoming_message(incoming_message)?
+                    }
+                }
+            }
+        }
+
+        self.writer.flush()?;
+        Ok(())
     }
 
     fn spawn_worker(
@@ -123,22 +158,25 @@ impl Collector {
         batch_idx: usize,
         batch: Vec<String>,
         sender: mpsc::Sender<IncomingMessage>,
-        event_receiver: mpsc::Receiver<Command>,
+        command_receiver: mpsc::Receiver<Command>,
     ) {
         let signal_receiver = self.signal_receiver.clone();
 
         self.join_set.spawn(async move {
             sleep(startup_delay).await;
-            run_worker(
+            let worker = Worker::new(
                 new_socket_id,
                 batch_idx,
                 batch,
                 sender,
-                event_receiver,
+                command_receiver,
                 signal_receiver,
-            )
-            .await
-            .map_err(|e| (new_socket_id, batch_idx, e))
+            );
+
+            worker
+                .run()
+                .await
+                .map_err(|e| (new_socket_id, batch_idx, e))
         });
     }
 
@@ -149,7 +187,8 @@ impl Collector {
             self.subscription.remove_socket(batch_idx, dead_socket_id);
 
             if let Some(main_sender) = self.main_sender.clone() {
-                let (new_socket_id, event_receiver) = self.subscription.register_socket(batch_idx);
+                let (new_socket_id, command_receiver) =
+                    self.subscription.register_socket(batch_idx);
 
                 for asset_id in batch.iter() {
                     let Some(books) = self.symbol_books.get_mut(asset_id) else {
@@ -170,7 +209,7 @@ impl Collector {
                     batch_idx,
                     batch,
                     main_sender,
-                    event_receiver,
+                    command_receiver,
                 );
             }
         }
@@ -283,42 +322,6 @@ impl Collector {
             Some(Err(err)) => eprintln!("Task returned with error: {err:?}"),
         }
 
-        Ok(())
-    }
-
-    pub async fn run(&mut self) -> Result<()> {
-        let sigint = signal::ctrl_c();
-        tokio::pin!(sigint);
-
-        self.snapshot_timer.tick().await;
-
-        loop {
-            let can_shutdown =
-                self.shutting_down && self.all_events_processed && self.work_complete;
-            let can_view_join_result =
-                !self.work_complete && (self.shutting_down || !self.join_set.is_empty());
-
-            if can_shutdown {
-                break;
-            }
-
-            tokio::select! {
-                _ = &mut sigint, if !self.shutting_down => self.begin_shutdown()?,
-                _ = self.snapshot_timer.tick() => self.snapshot()?,
-                join_result = self.join_set.join_next(), if can_view_join_result => self.handle_worker_result(join_result)?,
-
-                incoming_message = self.receiver.recv(), if !self.all_events_processed => {
-                    match incoming_message {
-                        None => {
-                            self.all_events_processed = true;
-                        }
-                        Some(incoming_message) => self.handle_incoming_message(incoming_message)?
-                    }
-                }
-            }
-        }
-
-        self.writer.flush()?;
         Ok(())
     }
 }

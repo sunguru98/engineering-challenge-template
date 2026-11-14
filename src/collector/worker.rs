@@ -1,17 +1,25 @@
 use std::collections::HashSet;
 use std::time::Duration;
 
+use anyhow::{Result, bail};
 use chrono::{DateTime, Utc};
-use futures_util::{SinkExt, StreamExt};
-use rand::RngExt;
-use tokio::{
-    sync::{mpsc, watch},
-    time::{interval, timeout},
+use futures_util::{
+    SinkExt, StreamExt,
+    stream::{SplitSink, SplitStream},
 };
-use tokio_tungstenite::{connect_async, tungstenite::Message};
+use tokio::{
+    net::TcpStream,
+    sync::{mpsc, watch},
+    time::{Interval, interval, timeout},
+};
+use tokio_tungstenite::{
+    MaybeTlsStream, WebSocketStream, connect_async,
+    tungstenite::Message::{self, Text},
+};
 
 use crate::{
-    constants::{MAX_ATTEMPTS, STABLE_CHECK_SECONDS},
+    backoff::Backoff,
+    constants::{CLOSE_REPLY_TIMEOUT_SECONDS, STABLE_CHECK_SECONDS},
     exchanges::{
         messages::{Command, MarketEvent},
         polymarket::{
@@ -21,166 +29,205 @@ use crate::{
     },
 };
 
+type WsType = WebSocketStream<MaybeTlsStream<TcpStream>>;
+
 pub struct IncomingMessage {
     pub socket_id: usize,
     pub received_at: DateTime<Utc>,
     pub market_events: Vec<MarketEvent>,
 }
-
-pub async fn run_worker(
+pub struct Worker {
     socket_id: usize,
     batch_idx: usize,
-    batch: Vec<String>,
     sender: mpsc::Sender<IncomingMessage>,
-    mut event_receiver: mpsc::Receiver<Command>,
-    mut signal_receiver: watch::Receiver<bool>,
-) -> anyhow::Result<(usize, usize)> {
-    let mut event_sender_closed = false;
-    let mut attempt_number = 1;
-    let mut delay_seconds = std::time::Duration::from_secs(1);
-    let maximum_delay_seconds = std::time::Duration::from_secs(30);
-    let mut worker_symbols: HashSet<String> = HashSet::new();
-    let mut heartbeat_interval = interval(Duration::from_secs(HEARTBEAT_TIMER_SECONDS));
+    command_receiver: mpsc::Receiver<Command>,
+    signal_receiver: watch::Receiver<bool>,
+    symbols: HashSet<String>,
+    heartbeat_timer: Interval,
+    command_closed: bool,
+    backoff: Backoff,
+}
 
-    for key in batch.into_iter() {
-        worker_symbols.insert(key);
-    }
-    heartbeat_interval.tick().await;
-
-    loop {
-        let connected_at = std::time::Instant::now();
-
-        let result: anyhow::Result<()> = async {
-            let (stream, _) = connect_async(
-                WS_URL,
-            )
-            .await?;
-
-            let (mut write, mut read) = stream.split();
-
-            let payload = encode_initial_subscribe(&worker_symbols);
-
-            write
-                .send(Message::Text(
-                    payload.into(),
-                ))
-                .await?;
-
-            eprintln!("Subscription done for websocket #{socket_id} for batch #{batch_idx}");
-            loop {
-                tokio::select! {
-                    _ = signal_receiver.changed() => {
-                        if *signal_receiver.borrow() {
-                            if let Err(err) = write.send(Message::Close(None)).await {
-                                eprintln!("Shutdown close frame error: {err:?}");
-                                break;
-                            }
-
-                            let timeout_res = timeout(Duration::from_secs(2), async {
-                                while let Some(response) = read.next().await {
-                                    match response {
-                                        Ok(Message::Close(_)) =>  {
-                                            eprintln!("Websocket #{socket_id} for #{batch_idx} closed succesfully");
-                                            break;
-                                        }
-                                        Ok(_) => continue,
-                                        Err(_) => break,
-                                    }
-                                }
-                            }).await;
-
-                            if timeout_res.is_err() {
-                                eprintln!("Websocket #{socket_id} for #{batch_idx} shutdown reply timed out")
-                            }
-
-                            break;
-                        }
-                    }
-                    _ = heartbeat_interval.tick() => {
-                        write.send(encode_heartbeat_message()).await?;
-                    }
-
-                    command = event_receiver.recv(), if !event_sender_closed => {
-                        match command {
-                            Some(command) => {
-                                let payload = encode_command(&command);
-                                match command {
-                                    Command::Unsubscribe { symbols } => {
-                                        write.send(payload.into()).await?;
-                                        eprintln!("Unsubscribed market of {symbols:?} succesfully");
-                                        for id in symbols {
-                                            worker_symbols.remove(&id);
-                                        }
-                                    },
-                                    Command::Subscribe { symbols } => {
-                                        write.send(payload.into()).await?;
-                                        eprintln!("New market of {symbols:?} added succesfully");
-                                        for id in symbols {
-                                            worker_symbols.insert(id);
-                                        }
-                                    }
-                                }
-                            },
-                            None => {
-                                event_sender_closed = true
-                            }
-                        }
-                    }
-
-                    response = read.next() => {
-                        let Some(response) = response else {
-                            anyhow::bail!("Stream ended unxpectedly");
-                        };
-
-                        match response {
-                            Ok(Message::Text(text)) => {
-                                let received_at = Utc::now();
-                                let market_events = decode(&text);
-                                if !market_events.is_empty() {
-                                    sender.send(IncomingMessage {
-                                        market_events,
-                                        received_at,
-                                        socket_id,
-                                    }).await?;
-                                }
-                            }
-                            Ok(other_msg) => eprintln!("Other message received: {other_msg}"),
-                            Err(e) => anyhow::bail!(e),
-                        }
-                    }
-                }
-            }
-            Ok(())
-        }.await;
-
-        match result {
-            Ok(()) => break,
-            Err(err) => eprintln!("Connection error: {err}"),
-        }
-
-        if connected_at.elapsed() > Duration::from_secs(STABLE_CHECK_SECONDS) {
-            attempt_number = 0;
-            delay_seconds = Duration::from_secs(1);
-        }
-
-        let jitter_ms = Duration::from_millis(rand::rng().random_range(0..750));
-        let waiting_seconds = delay_seconds + jitter_ms;
-        tokio::select! {
-            _ = signal_receiver.changed() => {
-                if *signal_receiver.borrow() {
-                    break;
-                }
-            }
-            _ = tokio::time::sleep(waiting_seconds) => {}
-        }
-
-        delay_seconds = (delay_seconds * 2).min(maximum_delay_seconds);
-        attempt_number += 1;
-
-        if attempt_number > MAX_ATTEMPTS {
-            anyhow::bail!("Connection failed");
+impl Worker {
+    pub fn new(
+        socket_id: usize,
+        batch_idx: usize,
+        batch: Vec<String>,
+        sender: mpsc::Sender<IncomingMessage>,
+        command_receiver: mpsc::Receiver<Command>,
+        signal_receiver: watch::Receiver<bool>,
+    ) -> Self {
+        let symbols = batch.into_iter().collect::<HashSet<String>>();
+        Self {
+            backoff: Backoff::new(),
+            batch_idx,
+            command_receiver,
+            command_closed: false,
+            heartbeat_timer: interval(Duration::from_secs(HEARTBEAT_TIMER_SECONDS)),
+            sender,
+            signal_receiver,
+            socket_id,
+            symbols,
         }
     }
 
-    Ok((batch_idx, socket_id))
+    pub async fn run(mut self) -> Result<(usize, usize)> {
+        self.heartbeat_timer.tick().await;
+
+        loop {
+            let connected_at = std::time::Instant::now();
+            match self.run_session().await {
+                Ok(()) => break,
+                Err(err) => eprintln!("Connection error: {err}"),
+            }
+
+            if connected_at.elapsed() > Duration::from_secs(STABLE_CHECK_SECONDS) {
+                self.backoff.reset();
+            }
+
+            tokio::select! {
+                _ = self.signal_receiver.changed() => {
+                    if *self.signal_receiver.borrow() {
+                        break;
+                    }
+                }
+                _ = tokio::time::sleep(self.backoff.wait_time()) => {}
+            }
+
+            self.backoff.record_failure();
+            if self.backoff.is_exhausted() {
+                bail!("Connection failed");
+            }
+        }
+
+        Ok((self.batch_idx, self.socket_id))
+    }
+
+    async fn run_session(&mut self) -> Result<()> {
+        let (stream, _) = connect_async(WS_URL).await?;
+        let (mut write, mut read) = stream.split();
+        let payload = encode_initial_subscribe(&self.symbols);
+        write.send(Message::Text(payload.into())).await?;
+
+        eprintln!(
+            "Subscription done for websocket #{} for batch #{}",
+            self.socket_id, self.batch_idx
+        );
+
+        loop {
+            tokio::select! {
+                _ = self.signal_receiver.changed() => {
+                    if *self.signal_receiver.borrow() {
+                        self.close_connection(write, read).await;
+                        break;
+                    }
+                }
+                _ = self.heartbeat_timer.tick() => {
+                    write.send(encode_heartbeat_message()).await?;
+                }
+
+                command = self.command_receiver.recv(), if !self.command_closed => {
+                    match command {
+                        Some(command) => {
+                            let payload = self.handle_command(command);
+                            write.send(payload.into()).await?;
+                        },
+                        None => {
+                            self.command_closed = true
+                        }
+                    }
+                }
+
+                response = read.next() => {
+                    let Some(response) = response else {
+                        bail!("Stream ended unxpectedly");
+                    };
+
+                    match response {
+                        Ok(message) => self.handle_message(message).await?,
+                        Err(e) => bail!(e),
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn handle_message(&self, message: Message) -> Result<()> {
+        match message {
+            Text(text) => {
+                let received_at = Utc::now();
+                let market_events = decode(&text);
+                if !market_events.is_empty() {
+                    self.sender
+                        .send(IncomingMessage {
+                            market_events,
+                            received_at,
+                            socket_id: self.socket_id,
+                        })
+                        .await?;
+                }
+            }
+
+            other_msg => eprintln!("Other message received: {other_msg}"),
+        }
+
+        Ok(())
+    }
+
+    async fn close_connection(
+        &self,
+        mut write: SplitSink<WsType, Message>,
+        mut read: SplitStream<WsType>,
+    ) {
+        if let Err(err) = write.send(Message::Close(None)).await {
+            eprintln!("Shutdown close frame error: {err:?}");
+            return;
+        }
+
+        let timeout_res = timeout(Duration::from_secs(CLOSE_REPLY_TIMEOUT_SECONDS), async {
+            while let Some(response) = read.next().await {
+                match response {
+                    Ok(Message::Close(_)) => {
+                        eprintln!(
+                            "Websocket #{} for #{} closed succesfully",
+                            self.socket_id, self.batch_idx
+                        );
+                        break;
+                    }
+                    Ok(_) => continue,
+                    Err(_) => break,
+                }
+            }
+        })
+        .await;
+
+        if timeout_res.is_err() {
+            eprintln!(
+                "Websocket #{} for #{} shutdown reply timed out",
+                self.socket_id, self.batch_idx
+            );
+        }
+    }
+
+    fn handle_command(&mut self, command: Command) -> String {
+        let payload = encode_command(&command);
+        match command {
+            Command::Unsubscribe { symbols } => {
+                eprintln!("Sending Unsubscribe market of {symbols:?}");
+                for id in symbols {
+                    self.symbols.remove(&id);
+                }
+            }
+            Command::Subscribe { symbols } => {
+                eprintln!("Sending subscribe market of {symbols:?}");
+                for id in symbols {
+                    self.symbols.insert(id);
+                }
+            }
+        }
+
+        payload
+    }
 }

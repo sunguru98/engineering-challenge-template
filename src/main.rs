@@ -1,5 +1,6 @@
 use anyhow::Result;
 
+mod backoff;
 mod collector;
 mod constants;
 mod exchanges;

@@ -1,6 +1,9 @@
 use rand::RngExt;
 
-use crate::{constants::MAX_ATTEMPTS, exchanges::polymarket::HTTP_URL};
+use crate::{
+    constants::MAX_ATTEMPTS,
+    exchanges::polymarket::{HTTP_URL, MAX_EVENTS_FETCH},
+};
 
 async fn fetch_page(
     client: &reqwest::Client,
@@ -89,7 +92,7 @@ pub async fn fetch_all_markets() -> anyhow::Result<Vec<String>> {
     let mut query_params: std::collections::HashMap<&str, String> =
         std::collections::HashMap::new();
     query_params.insert("closed", "false".to_string());
-    query_params.insert("limit", "100".to_string());
+    query_params.insert("limit", MAX_EVENTS_FETCH.to_string());
 
     let client = reqwest::Client::new();
     let mut all_token_ids = vec![];
