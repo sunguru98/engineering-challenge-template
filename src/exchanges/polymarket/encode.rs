@@ -11,6 +11,7 @@ pub fn encode_initial_subscribe(symbols: &HashSet<String>) -> String {
         "type": "market",
         "custom_feature_enabled": true,
         "initial_dump": true,
+        "level": 2,
     });
 
     payload.to_string()
@@ -23,6 +24,7 @@ pub fn encode_command(command: &Command) -> String {
                 "operation": "unsubscribe",
                 "assets_ids": symbols,
                 "custom_feature_enabled": true,
+                "level": 2,
             })
         }
         Command::Subscribe { symbols } => {
@@ -30,6 +32,7 @@ pub fn encode_command(command: &Command) -> String {
                 "operation": "subscribe",
                 "assets_ids": symbols,
                 "custom_feature_enabled": true,
+                "level": 2,
             })
         }
     };

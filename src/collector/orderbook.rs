@@ -30,10 +30,17 @@ impl Orderbook {
 }
 
 #[derive(Debug)]
+pub struct StallTimer {
+    since: DateTime<Utc>,
+    newest_exchange_time: DateTime<Utc>,
+}
+
+#[derive(Debug)]
 pub struct Books {
     socket_orderbook: HashMap<usize, Orderbook>,
     primary_socket_id: Option<usize>,
-    stalled_since: Option<DateTime<Utc>>,
+    stall_timer: Option<StallTimer>,
+    create_from_first_update: bool,
 }
 
 impl Books {
@@ -41,7 +48,8 @@ impl Books {
         Self {
             socket_orderbook: HashMap::new(),
             primary_socket_id: None,
-            stalled_since: None,
+            stall_timer: None,
+            create_from_first_update: true,
         }
     }
 
@@ -54,9 +62,11 @@ impl Books {
     }
 
     pub fn drop_socket(&mut self, socket_id: usize) -> WriteAction {
-        self.stalled_since = None;
+        self.stall_timer = None;
         let is_primary_socket = self.primary_socket_id == Some(socket_id);
         self.socket_orderbook.remove(&socket_id);
+        self.create_from_first_update = false;
+
         if !is_primary_socket {
             return WriteAction::Nothing;
         }
@@ -100,6 +110,14 @@ impl Books {
         orderbook.bids = bids;
 
         self.socket_orderbook.insert(socket_id, orderbook);
+
+        if self.primary_socket_id == Some(socket_id) {
+            if let Some(stall_timer) = &self.stall_timer
+                && timestamp >= stall_timer.newest_exchange_time
+            {
+                self.stall_timer = None;
+            }
+        }
     }
 
     pub fn apply_update(
@@ -111,6 +129,12 @@ impl Books {
         quantity: i64,
         received_at: DateTime<Utc>,
     ) -> WriteAction {
+        if self.socket_orderbook.get(&socket_id).is_none() {
+            if !self.create_from_first_update {
+                return WriteAction::Nothing;
+            }
+        }
+
         if self.primary_socket_id.is_none() {
             self.primary_socket_id = Some(socket_id);
         }
@@ -133,24 +157,49 @@ impl Books {
         }
 
         if self.primary_socket_id == Some(socket_id) {
-            self.stalled_since = None;
+            if let Some(stall_timer) = &self.stall_timer
+                && timestamp >= stall_timer.newest_exchange_time
+            {
+                self.stall_timer = None;
+            }
+
             return WriteAction::Update;
         }
 
-        match self.stalled_since {
-            None => {
-                self.stalled_since = Some(received_at);
+        if let Some(primary_book) = self.primary_book() {
+            if primary_book.timestamp >= timestamp {
                 return WriteAction::Nothing;
             }
-            Some(t) => {
-                let time_elapsed = received_at - t;
-                if time_elapsed >= TimeDelta::seconds(STALL_TIMER_SECONDS) {
-                    self.primary_socket_id = Some(socket_id);
-                    self.stalled_since = None;
-                    return WriteAction::Snapshot;
+
+            match &mut self.stall_timer {
+                None => {
+                    self.stall_timer = Some(StallTimer {
+                        since: received_at,
+                        newest_exchange_time: timestamp,
+                    });
+
+                    return WriteAction::Nothing;
                 }
-                return WriteAction::Nothing;
+
+                Some(timer) => {
+                    timer.newest_exchange_time = timer.newest_exchange_time.max(timestamp);
+                    let time_elapsed = received_at - timer.since;
+                    if time_elapsed >= TimeDelta::seconds(STALL_TIMER_SECONDS) {
+                        if let Some(primary_socket_id) = &self.primary_socket_id {
+                            self.socket_orderbook.remove(primary_socket_id);
+                            self.create_from_first_update = false;
+                        }
+
+                        self.primary_socket_id = Some(socket_id);
+                        self.stall_timer = None;
+                        return WriteAction::Snapshot;
+                    }
+
+                    return WriteAction::Nothing;
+                }
             }
         }
+
+        return WriteAction::Nothing;
     }
 }
