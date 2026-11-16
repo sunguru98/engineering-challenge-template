@@ -6,7 +6,7 @@ use std::collections::{HashMap, HashSet};
 pub struct Subscription {
     symbol_batch_map: HashMap<String, usize>,
     batch_socket_ids_map: HashMap<usize, HashSet<usize>>,
-    socket_event_sender_map: HashMap<usize, Sender<Command>>,
+    socket_command_sender_map: HashMap<usize, Sender<Command>>,
     next_batch_idx: usize,
     number_of_batches: usize,
     next_socket_id: usize,
@@ -24,7 +24,7 @@ impl Subscription {
         Self {
             symbol_batch_map,
             batch_socket_ids_map: HashMap::new(),
-            socket_event_sender_map: HashMap::new(),
+            socket_command_sender_map: HashMap::new(),
             next_batch_idx: 0,
             number_of_batches: batches.len(),
             next_socket_id: 0,
@@ -39,7 +39,7 @@ impl Subscription {
     }
 
     pub fn is_socket_alive(&self, socket_id: usize) -> bool {
-        self.socket_event_sender_map.contains_key(&socket_id)
+        self.socket_command_sender_map.contains_key(&socket_id)
     }
 
     pub fn symbols_in_batch(&self, batch_idx: usize) -> Vec<String> {
@@ -57,12 +57,12 @@ impl Subscription {
         };
 
         for socket_id in socket_ids {
-            let Some(event_sender) = self.socket_event_sender_map.get(socket_id) else {
+            let Some(command_sender) = self.socket_command_sender_map.get(socket_id) else {
                 eprintln!("Socket #{socket_id} not found");
                 continue;
             };
 
-            if let Err(err) = event_sender.try_send(command.clone()) {
+            if let Err(err) = command_sender.try_send(command.clone()) {
                 eprintln!("Error sending batch #{batch_idx} event: {err:?}");
                 continue;
             };
@@ -87,20 +87,20 @@ impl Subscription {
 
     pub fn register_socket(&mut self, batch_idx: usize) -> (usize, Receiver<Command>) {
         let current_socket_id = self.next_socket_id;
-        let (event_sender, event_receiver) = mpsc::channel(UPDATE_EVENT_CHANNEL_SIZE);
+        let (command_sender, command_receiver) = mpsc::channel(UPDATE_EVENT_CHANNEL_SIZE);
 
         let socket_ids = self.batch_socket_ids_map.entry(batch_idx).or_default();
         socket_ids.insert(current_socket_id);
 
-        self.socket_event_sender_map
-            .insert(self.next_socket_id, event_sender);
+        self.socket_command_sender_map
+            .insert(self.next_socket_id, command_sender);
         self.next_socket_id += 1;
 
-        (current_socket_id, event_receiver)
+        (current_socket_id, command_receiver)
     }
 
     pub fn remove_socket(&mut self, batch_idx: usize, socket_id: usize) {
-        self.socket_event_sender_map.remove(&socket_id);
+        self.socket_command_sender_map.remove(&socket_id);
         if let Some(socket_ids) = self.batch_socket_ids_map.get_mut(&batch_idx) {
             socket_ids.remove(&socket_id);
         }

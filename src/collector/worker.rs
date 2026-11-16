@@ -1,5 +1,5 @@
-use std::collections::HashSet;
 use std::time::Duration;
+use std::{collections::HashSet, time::Instant};
 
 use anyhow::{Result, bail};
 use chrono::{DateTime, Utc};
@@ -19,7 +19,7 @@ use tokio_tungstenite::{
 
 use crate::{
     backoff::Backoff,
-    constants::{CLOSE_REPLY_TIMEOUT_SECONDS, STABLE_CHECK_SECONDS},
+    constants::{CLOSE_REPLY_TIMEOUT_SECONDS, SOCKET_LIVENESS_SECONDS, STABLE_CHECK_SECONDS},
     exchanges::{
         adapter::Adapter,
         messages::{Command, MarketEvent},
@@ -30,6 +30,7 @@ type WsType = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
 pub struct IncomingMessage {
     pub socket_id: usize,
+    pub batch_idx: usize,
     pub received_at: DateTime<Utc>,
     pub market_events: Vec<MarketEvent>,
 }
@@ -42,8 +43,10 @@ pub struct Worker<Exchange> {
     signal_receiver: watch::Receiver<bool>,
     symbols: HashSet<String>,
     heartbeat_timer: Interval,
-    command_closed: bool,
     backoff: Backoff,
+    command_closed: bool,
+    session_established: bool,
+    last_message_at: Option<Instant>,
 }
 
 impl<Exchange> Worker<Exchange>
@@ -66,12 +69,14 @@ where
             backoff: Backoff::new(),
             batch_idx,
             command_receiver,
-            command_closed: false,
             heartbeat_timer,
             sender,
             signal_receiver,
             socket_id,
             symbols,
+            command_closed: false,
+            session_established: false,
+            last_message_at: None,
         }
     }
 
@@ -79,10 +84,23 @@ where
         self.heartbeat_timer.tick().await;
 
         loop {
-            let connected_at = std::time::Instant::now();
+            let connected_at = Instant::now();
             match self.run_session().await {
                 Ok(()) => break,
-                Err(err) => eprintln!("Connection error: {err}"),
+                Err(err) => {
+                    eprintln!("Connection error: {err}");
+                    if self.session_established {
+                        self.session_established = false;
+                        self.sender
+                            .send(IncomingMessage {
+                                socket_id: self.socket_id,
+                                batch_idx: self.batch_idx,
+                                received_at: Utc::now(),
+                                market_events: vec![MarketEvent::Disconnected],
+                            })
+                            .await?;
+                    }
+                }
             }
 
             if connected_at.elapsed() > Duration::from_secs(STABLE_CHECK_SECONDS) {
@@ -118,6 +136,9 @@ where
             self.socket_id, self.batch_idx
         );
 
+        self.last_message_at = Some(Instant::now());
+        self.session_established = true;
+
         loop {
             tokio::select! {
                 _ = self.signal_receiver.changed() => {
@@ -127,6 +148,13 @@ where
                     }
                 }
                 _ = self.heartbeat_timer.tick() => {
+                    if let Some(last_message_at) = self.last_message_at {
+                        let elapsed_time = last_message_at.elapsed();
+                        if elapsed_time >= Duration::from_secs(SOCKET_LIVENESS_SECONDS) {
+                            bail!("No new message since {elapsed_time:?}");
+                        }
+                    }
+
                     write.send(self.exchange.heartbeat_message()).await?;
                 }
 
@@ -148,7 +176,10 @@ where
                     };
 
                     match response {
-                        Ok(message) => self.handle_message(message).await?,
+                        Ok(message) => {
+                            self.last_message_at = Some(Instant::now());
+                            self.handle_message(message).await?
+                        },
                         Err(e) => bail!(e),
                     }
                 }
@@ -166,9 +197,10 @@ where
                 if !market_events.is_empty() {
                     self.sender
                         .send(IncomingMessage {
+                            socket_id: self.socket_id,
+                            batch_idx: self.batch_idx,
                             market_events,
                             received_at,
-                            socket_id: self.socket_id,
                         })
                         .await?;
                 }

@@ -43,7 +43,7 @@ struct PriceChange {
     size: String,
 }
 
-fn extract_asset_id(market: &Value) -> Option<String> {
+fn extract_symbol(market: &Value) -> Option<String> {
     if market["active"].as_bool() != Some(true) {
         return None;
     }
@@ -140,14 +140,14 @@ fn decode_price_change(event: &Value) -> Result<Vec<MarketEvent>> {
             side,
             price,
             new_quantity: quantity,
-        })
+        });
     }
 
     Ok(market_events)
 }
 
 fn decode_new_market(event: &Value) -> Result<Vec<MarketEvent>> {
-    let Some(symbol) = extract_asset_id(event) else {
+    let Some(symbol) = extract_symbol(event) else {
         return Ok(vec![]);
     };
 
@@ -181,7 +181,7 @@ pub fn decode(raw_message: &str) -> Vec<MarketEvent> {
             continue;
         };
 
-        if let Ok(mut market_events) = match event_type {
+        let event_result = match event_type {
             "book" => decode_book(&event),
             "price_change" => decode_price_change(&event),
             "new_market" => decode_new_market(&event),
@@ -189,10 +189,13 @@ pub fn decode(raw_message: &str) -> Vec<MarketEvent> {
             _ => {
                 continue;
             }
-        } {
-            all_events.append(&mut market_events)
-        } else {
-            eprintln!("Failed to decode {event_type}");
+        };
+
+        match event_result {
+            Ok(mut market_events) => all_events.append(&mut market_events),
+            Err(err) => {
+                eprintln!("Failed to decode {event_type} .. Error: {err:?}");
+            }
         }
     }
 

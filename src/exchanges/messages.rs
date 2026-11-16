@@ -34,4 +34,5 @@ pub enum MarketEvent {
     SymbolRemoved {
         symbol: String,
     },
+    Disconnected,
 }

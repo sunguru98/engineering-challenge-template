@@ -16,25 +16,33 @@ use crate::{
 };
 
 pub fn apply_snapshot(
+    writer: &mut AlignedSbeWriter,
     socket_id: usize,
     symbol_books_map: &mut HashMap<String, Books>,
     symbol: String,
     timestamp: DateTime<Utc>,
     bids: Vec<Level>,
     asks: Vec<Level>,
-) {
+) -> Result<()> {
     let Some(books) = symbol_books_map.get_mut(&symbol) else {
-        return;
+        return Ok(());
     };
 
-    books.apply_snapshot(socket_id, timestamp, bids, asks);
+    let write_action = books.apply_snapshot(socket_id, timestamp, bids, asks);
+    if write_action == WriteAction::Snapshot {
+        if let Some(primary_orderbook) = books.primary_book() {
+            write_snapshot(&symbol, primary_orderbook, writer)?;
+        }
+    }
+
+    Ok(())
 }
 
 pub fn apply_level_update(
+    writer: &mut AlignedSbeWriter,
     socket_id: usize,
     symbol_books_map: &mut HashMap<String, Books>,
     symbol: String,
-    writer: &mut AlignedSbeWriter,
     timestamp: DateTime<Utc>,
     side: Side,
     price: i64,

@@ -190,31 +190,19 @@ where
     fn replace_worker(&mut self, batch_idx: usize, dead_socket_id: usize) -> Result<()> {
         if !self.shutting_down {
             eprintln!("Retrying Websocket #{batch_idx}");
-            let batch: Vec<String> = self.subscription.symbols_in_batch(batch_idx);
+            let symbols: Vec<String> = self.subscription.symbols_in_batch(batch_idx);
             self.subscription.remove_socket(batch_idx, dead_socket_id);
 
             if let Some(main_sender) = self.main_sender.clone() {
                 let (new_socket_id, command_receiver) =
                     self.subscription.register_socket(batch_idx);
 
-                for asset_id in batch.iter() {
-                    let Some(books) = self.symbol_books.get_mut(asset_id) else {
-                        continue;
-                    };
-
-                    let write_action = books.drop_socket(dead_socket_id);
-                    if write_action == WriteAction::Snapshot {
-                        if let Some(primary_orderbook) = books.primary_book() {
-                            write_snapshot(asset_id, primary_orderbook, &mut self.writer)?;
-                        }
-                    }
-                }
-
+                self.remove_dead_socket(batch_idx, dead_socket_id)?;
                 self.spawn_worker(
                     Duration::ZERO,
                     new_socket_id,
                     batch_idx,
-                    batch,
+                    symbols,
                     main_sender,
                     command_receiver,
                 );
@@ -224,30 +212,63 @@ where
         Ok(())
     }
 
-    fn handle_incoming_message(&mut self, incoming_message: IncomingMessage) -> Result<()> {
-        for event in incoming_message.market_events {
+    fn remove_dead_socket(&mut self, batch_idx: usize, socket_id: usize) -> Result<()> {
+        for symbol in self.subscription.symbols_in_batch(batch_idx) {
+            let Some(books) = self.symbol_books.get_mut(&symbol) else {
+                continue;
+            };
+
+            let write_action = books.drop_socket(socket_id);
+            if write_action == WriteAction::Snapshot {
+                let Some(orderbook) = books.primary_book() else {
+                    continue;
+                };
+
+                write_snapshot(&symbol, orderbook, &mut self.writer)?;
+            }
+        }
+
+        Ok(())
+    }
+
+    fn handle_incoming_message(
+        &mut self,
+        IncomingMessage {
+            market_events,
+            socket_id,
+            batch_idx,
+            received_at,
+        }: IncomingMessage,
+    ) -> Result<()> {
+        for event in market_events {
             match event {
+                MarketEvent::Disconnected => {
+                    if !self.subscription.is_socket_alive(socket_id) {
+                        continue;
+                    }
+
+                    self.remove_dead_socket(batch_idx, socket_id)?;
+                }
+
                 MarketEvent::Snapshot {
                     symbol,
                     asks,
                     bids,
                     exchange_time,
                 } => {
-                    if !self
-                        .subscription
-                        .is_socket_alive(incoming_message.socket_id)
-                    {
+                    if !self.subscription.is_socket_alive(socket_id) {
                         continue;
                     }
 
                     apply_snapshot(
-                        incoming_message.socket_id,
+                        &mut self.writer,
+                        socket_id,
                         &mut self.symbol_books,
                         symbol,
                         exchange_time,
                         bids,
                         asks,
-                    );
+                    )?;
                 }
 
                 MarketEvent::LevelUpdate {
@@ -257,23 +278,20 @@ where
                     side,
                     symbol,
                 } => {
-                    if !self
-                        .subscription
-                        .is_socket_alive(incoming_message.socket_id)
-                    {
+                    if !self.subscription.is_socket_alive(socket_id) {
                         continue;
                     }
 
                     apply_level_update(
-                        incoming_message.socket_id,
+                        &mut self.writer,
+                        socket_id,
                         &mut self.symbol_books,
                         symbol,
-                        &mut self.writer,
                         exchange_time,
                         side,
                         price,
                         new_quantity,
-                        incoming_message.received_at,
+                        received_at,
                     )?;
                 }
 

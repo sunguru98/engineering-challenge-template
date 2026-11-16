@@ -62,12 +62,14 @@ impl Books {
     }
 
     pub fn drop_socket(&mut self, socket_id: usize) -> WriteAction {
+        if self.socket_orderbook.remove(&socket_id).is_none() {
+            return WriteAction::Nothing;
+        };
+
         self.stall_timer = None;
-        let is_primary_socket = self.primary_socket_id == Some(socket_id);
-        self.socket_orderbook.remove(&socket_id);
         self.create_from_first_update = false;
 
-        if !is_primary_socket {
+        if self.primary_socket_id != Some(socket_id) {
             return WriteAction::Nothing;
         }
 
@@ -89,7 +91,7 @@ impl Books {
         timestamp: DateTime<Utc>,
         bids: Vec<Level>,
         asks: Vec<Level>,
-    ) {
+    ) -> WriteAction {
         if self.primary_socket_id.is_none() {
             self.primary_socket_id = Some(socket_id);
         }
@@ -104,6 +106,12 @@ impl Books {
             .map(|level| (level.price, level.quantity))
             .collect();
 
+        let changed = if let Some(old) = self.socket_orderbook.get(&socket_id) {
+            old.bids != bids || old.asks != asks
+        } else {
+            !self.create_from_first_update
+        };
+
         let mut orderbook = Orderbook::new();
         orderbook.timestamp = timestamp;
         orderbook.asks = asks;
@@ -117,7 +125,13 @@ impl Books {
             {
                 self.stall_timer = None;
             }
+
+            if changed {
+                return WriteAction::Snapshot;
+            }
         }
+
+        WriteAction::Nothing
     }
 
     pub fn apply_update(
