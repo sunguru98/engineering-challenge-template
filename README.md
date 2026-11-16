@@ -1,5 +1,7 @@
 # Voluntas Engineering Challenge
 
+Records Polymarket order books to a binary file in the challenge's SBE format. It tracks the first token id of every active, order-book-enabled binary market.
+
 ## Architecture (Code flow)
 
 ```text
@@ -37,13 +39,15 @@
 
 | File | Function |
 |---|---|
-| `src/main.rs` | Application entry point and orchestration |
-| `src/worker.rs` | WebSocket worker and subscription handling |
-| `src/handlers.rs` | Incoming market-event processing |
-| `src/orderbook.rs` | Orderbook struct and snapshot related functions |
-| `src/tokens.rs` | Asset fetching through HTTP cursor based pagination |
-
-The supplied schema and serialization helpers are used to keep the output compatible with the challenge's expected format.
+| `src/main.rs` | Entry point |
+| `src/collector/mod.rs` | Main loop, worker spawning, shutdown |
+| `src/collector/worker.rs` | One websocket connection: reconnect, heartbeat, liveness check |
+| `src/collector/orderbook.rs` | Order books per symbol, primary selection, failover |
+| `src/collector/handlers.rs` | Applies market events to the books and writes output |
+| `src/collector/snapshot.rs` | Snapshot writing |
+| `src/collector/subscription.rs` | Symbol to batch mapping, command routing to sockets |
+| `src/exchanges/adapter.rs` | Trait an exchange has to implement |
+| `src/exchanges/polymarket/` | Asset discovery, message decoding and encoding |
 
 ## Build and run
 
@@ -51,7 +55,7 @@ The supplied schema and serialization helpers are used to keep the output compat
 cargo build --release
 ```
 
-Run the application:
+Run the application. Logs go to stderr, and Ctrl-C closes the sockets and flushes the output:
 
 ```bash
 cargo run --release > /path_to_data.bin
